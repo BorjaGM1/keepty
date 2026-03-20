@@ -1,0 +1,32 @@
+# Rust
+/target
+
+# Internal docs (not for public repo)
+CLAUDE.md
+PROJECT.md
+backlog/
+tools/demo/
+demo.py
+docs/research/
+tools/byte-diff.sh
+tools/capture-bytes.py
+
+# Claude Code
+.claude/
+
+# External chat transcripts
+*view.md
+
+# TypeScript
+sdks/typescript/node_modules/
+sdks/typescript/dist/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# .NET
+sdks/dotnet/**/bin/
+sdks/dotnet/**/obj/

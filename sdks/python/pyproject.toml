@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keepty"
+version = "0.1.0"
+description = "Python SDK for keepty — persistent terminal sessions with a typed binary protocol"
+readme = {text = "Python SDK for keepty — persistent terminal sessions with a typed binary protocol.", content-type = "text/plain"}
+license = {text = "MIT OR Apache-2.0"}
+requires-python = ">=3.10"
+authors = [{name = "BorjaGM1"}]
+keywords = ["terminal", "pty", "tmux", "agent", "persistent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Shells",
+    "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+screen = ["pyte>=0.8"]
+
+[project.urls]
+Homepage = "https://github.com/BorjaGM1/keepty"
+Repository = "https://github.com/BorjaGM1/keepty"

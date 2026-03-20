@@ -1,0 +1,26 @@
+{
+  "name": "keepty",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for keepty — persistent terminal sessions with a typed binary protocol",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test tests/test_integration.mjs"
+  },
+  "keywords": ["terminal", "pty", "tmux", "agent", "persistent", "keepty"],
+  "author": "BorjaGM1",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BorjaGM1/keepty"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}

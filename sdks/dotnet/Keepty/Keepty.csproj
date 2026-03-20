@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>Keepty</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>BorjaGM1</Authors>
+    <Description>.NET SDK for keepty — persistent terminal sessions with a typed binary protocol</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/BorjaGM1/keepty</RepositoryUrl>
+    <PackageTags>terminal;pty;tmux;agent;persistent;keepty</PackageTags>
+  </PropertyGroup>
+
+</Project>

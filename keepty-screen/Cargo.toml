@@ -1,0 +1,12 @@
+[package]
+name = "keepty-screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Agent screen-reading layer for keepty. Connects to a broker as Monitor, parses PTY output via vt100, and exposes a clean screen-reading API."
+repository.workspace = true
+
+[dependencies]
+keepty-protocol = { workspace = true }
+vt100 = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "keepty-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Wire protocol for keepty — persistent PTY broker. Frame encoding/decoding, roles, message types. Zero external dependencies."
+repository.workspace = true
+
+[dependencies]
+# None — std only. This is intentional.
+# Anyone can depend on this crate with zero cost.

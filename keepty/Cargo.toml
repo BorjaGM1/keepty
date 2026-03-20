@@ -1,0 +1,22 @@
+[package]
+name = "keepty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Persistent PTY broker daemon. Spawns a command in a PTY, streams raw bytes to clients over a typed binary protocol."
+repository.workspace = true
+
+[[bin]]
+name = "keepty"
+path = "src/main.rs"
+
+[dependencies]
+keepty-protocol = { workspace = true }
+portable-pty = { workspace = true }
+nix = { workspace = true, features = ["signal", "process", "term"] }
+libc = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+vt100 = { workspace = true }
