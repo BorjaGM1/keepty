@@ -1,6 +1,9 @@
 # Rust
 /target
 
+# Environment / secrets
+.env*
+
 # Internal docs (not for public repo)
 CLAUDE.md
 PROJECT.md
