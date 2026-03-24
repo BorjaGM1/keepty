@@ -24,8 +24,20 @@ keepty attach --watch my-session
 # macOS (Apple Silicon) / Linux (x64, arm64)
 curl -sSf https://raw.githubusercontent.com/BorjaGM1/keepty/main/install.sh | sh
 
-# Or with Cargo
+# Homebrew
+brew install BorjaGM1/tap/keepty
+
+# Cargo
 cargo install keepty
+```
+
+### SDKs
+
+```bash
+pip install keepty          # Python
+npm install keepty          # TypeScript / Node
+go get github.com/BorjaGM1/keepty/sdks/go  # Go
+dotnet add package Keepty   # .NET
 ```
 
 ---
