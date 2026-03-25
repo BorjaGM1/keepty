@@ -148,7 +148,7 @@ fn draw_watcher_overlay(session_name: &str, session_size: Option<(u16, u16)>) {
         String::new()
     };
     overlay.push_str(&format!(
-        "\x1b[{};1H\x1b[2K\x1b[7m[{}{}] Ctrl+C detach | r refresh\x1b[0m\x1b8",
+        "\x1b[{};1H\x1b[2K\x1b[7m[{}{}] q detach | r refresh\x1b[0m\x1b8",
         term_rows, session_name, size_str
     ));
     raw_write_bytes(overlay.as_bytes());
@@ -393,9 +393,12 @@ pub fn run(session_id: &str, watch_mode: bool) -> io::Result<()> {
                         let data = &buf[..n];
 
                         // Detach / redraw detection:
-                        // - Watcher: Ctrl+C (0x03) detaches, r triggers Resize nudge
+                        // - Watcher: q or Ctrl+C (0x03) detaches, r triggers Resize nudge
+                        //   q is the primary detach key because Ctrl+C is unreliable when
+                        //   the child enables kitty keyboard protocol (CSI-u encodes it
+                        //   as \x1b[99;5u instead of 0x03).
                         // - Writer: ,,,d state machine — immune to CSI-u/kitty encoding
-                        if watch_mode && data.contains(&0x03) {
+                        if watch_mode && (data.contains(&0x03) || data.contains(&b'q')) {
                             break;
                         }
                         if watch_mode && data.contains(&b'r') {
