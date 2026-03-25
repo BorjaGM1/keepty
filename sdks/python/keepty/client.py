@@ -3,6 +3,7 @@ keepty client — connect to a keepty broker session.
 """
 
 import os
+import select
 import socket
 import shutil
 import subprocess
@@ -31,11 +32,14 @@ class Session:
             session.send_keys(b"echo hello\\n")
     """
 
-    def __init__(self, sock: socket.socket, role: Role, pty_pid: int, session_id: str):
+    def __init__(self, sock: socket.socket, role: Role, pty_pid: int, session_id: str,
+                 cols: int = 80, rows: int = 24):
         self._sock = sock
         self._role = role
         self._pty_pid = pty_pid
         self._session_id = session_id
+        self._cols = cols
+        self._rows = rows
 
     @classmethod
     def connect(
@@ -80,8 +84,43 @@ class Session:
             sock.close()
             raise ConnectionError(f"Expected HelloAck, got {ack.kind.name}")
 
-        pid, _, _ = decode_hello_ack(ack.payload)
-        return cls(sock, role, pid, session_id)
+        pid, ack_cols, ack_rows = decode_hello_ack(ack.payload)
+        return cls(sock, role, pid, session_id, ack_cols, ack_rows)
+
+    def _read_frames(self, timeout: float) -> list:
+        """Read all available frames within timeout using select().
+
+        Keeps the socket in blocking mode during actual frame reads
+        to prevent stream desynchronization from partial reads.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        frames = []
+        prev_timeout = self._sock.gettimeout()
+        self._sock.settimeout(None)  # blocking during reads
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select([self._sock], [], [], remaining)
+                if not readable:
+                    break
+                frame = Frame.read_from(self._sock)
+                if frame is None:
+                    break
+                frames.append(frame)
+                # Drain any immediately available frames without waiting
+                while True:
+                    readable, _, _ = select.select([self._sock], [], [], 0)
+                    if not readable:
+                        break
+                    frame = Frame.read_from(self._sock)
+                    if frame is None:
+                        return frames
+                    frames.append(frame)
+        finally:
+            self._sock.settimeout(prev_timeout)
+        return frames
 
     def read_output(self, timeout: float = 1.0) -> bytes:
         """Read output from the broker.
@@ -95,24 +134,15 @@ class Session:
         Returns:
             Raw output bytes. May be empty if no output within timeout.
         """
-        self._sock.settimeout(timeout)
         collected = bytearray()
-
-        try:
-            while True:
-                frame = Frame.read_from(self._sock)
-                if frame is None:
-                    break
-                if frame.kind == MsgKind.OUTPUT:
-                    collected.extend(frame.payload)
-                elif frame.kind == MsgKind.PING:
-                    Frame(MsgKind.PONG).write_to(self._sock)
-                elif frame.kind == MsgKind.EXIT:
-                    code = decode_exit(frame.payload)
-                    raise SessionExited(code)
-        except socket.timeout:
-            pass
-
+        for frame in self._read_frames(timeout):
+            if frame.kind == MsgKind.OUTPUT:
+                collected.extend(frame.payload)
+            elif frame.kind == MsgKind.PING:
+                Frame(MsgKind.PONG).write_to(self._sock)
+            elif frame.kind == MsgKind.EXIT:
+                code = decode_exit(frame.payload)
+                raise SessionExited(code)
         return bytes(collected)
 
     def read_until(self, expected: str, timeout: float = 5.0) -> str:

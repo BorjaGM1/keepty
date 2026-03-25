@@ -51,8 +51,8 @@ class ScreenReader:
         Args:
             session_id: The session to connect to.
             role: Monitor (read-only, default) or Writer (can interact).
-            cols: Virtual terminal columns.
-            rows: Virtual terminal rows.
+            cols: Requested terminal columns (broker may use different size).
+            rows: Requested terminal rows (broker may use different size).
 
         Returns:
             A connected ScreenReader.
@@ -69,20 +69,59 @@ class ScreenReader:
 
         session = Session.connect(session_id, role=role, cols=cols, rows=rows)
 
-        screen = pyte.Screen(cols, rows)
-        stream = pyte.Stream(screen)
+        # Use HelloAck dimensions (actual PTY size), not requested size
+        ack_cols = session._cols
+        ack_rows = session._rows
+
+        screen = pyte.Screen(ack_cols, ack_rows)
+        stream = pyte.ByteStream(screen)
 
         reader = cls(session, screen, stream)
 
-        # Process ring buffer replay
-        try:
-            data = session.read_output(timeout=1.0)
-            if data:
-                stream.feed(data.decode("utf-8", errors="replace"))
-        except SessionExited:
-            pass
+        # Prime the screen: drain replay + nudge re-render.
+        # Writers/Watchers get a nudge that takes ~300ms to produce output.
+        # We drain until output settles to ensure the full re-render is captured.
+        reader._prime(role)
 
         return reader
+
+    def _feed(self, data: bytes) -> None:
+        """Feed raw bytes into the terminal parser."""
+        if data:
+            self._stream.feed(data)
+
+    def _prime(self, role: Role) -> None:
+        """Drain initial output (replay + nudge re-render)."""
+        # First drain: ring buffer replay
+        try:
+            data = self._session.read_output(timeout=0.3)
+            self._feed(data)
+        except SessionExited:
+            return
+
+        # For Writer/Watcher: wait for nudge re-render to arrive
+        if role in (Role.WRITER, Role.WATCHER):
+            deadline = time.monotonic() + 1.5
+            saw_output = False
+            quiet_since = None
+            while time.monotonic() < deadline:
+                remaining = min(0.15, deadline - time.monotonic())
+                if remaining <= 0:
+                    break
+                try:
+                    data = self._session.read_output(timeout=remaining)
+                except SessionExited:
+                    return
+                if data:
+                    self._feed(data)
+                    saw_output = True
+                    quiet_since = None
+                else:
+                    if saw_output and quiet_since is None:
+                        quiet_since = time.monotonic()
+                    # If output settled for 150ms after seeing something, we're done
+                    if quiet_since and time.monotonic() - quiet_since >= 0.15:
+                        break
 
     def poll(self, timeout: float = 0.5) -> bool:
         """Process pending output frames and update screen state.
@@ -95,7 +134,7 @@ class ScreenReader:
         """
         data = self._session.read_output(timeout=timeout)
         if data:
-            self._stream.feed(data.decode("utf-8", errors="replace"))
+            self._feed(data)
             return True
         return False
 
@@ -117,16 +156,37 @@ class ScreenReader:
         return False
 
     def contents(self) -> str:
-        """Get the full screen text (all rows joined with newlines)."""
-        return "\n".join(
-            self._screen.display[row].rstrip()
-            for row in range(self._screen.lines)
-        )
+        """Get the full screen text (all rows joined with newlines).
+
+        Note: rows with only styled spaces (e.g., colored backgrounds in curses)
+        will appear as spaces, not empty strings. Use visible_contents() for
+        a representation that marks styled cells.
+        """
+        return "\n".join(self._screen.display)
+
+    def visible_contents(self) -> str:
+        """Get screen text with styled spaces marked.
+
+        Curses apps often draw rows of styled spaces (colored background).
+        Regular contents() preserves these as spaces, but rstrip() would
+        collapse them. This method marks styled cells so they're visible.
+        """
+        rows = []
+        for y in range(self._screen.lines):
+            chars = []
+            for x in range(self._screen.columns):
+                cell = self._screen.buffer[y][x]
+                ch = cell.data
+                if ch == " " and (cell.bg != "default" or cell.fg != "default" or cell.reverse):
+                    ch = "\u2588"  # Full block for styled spaces
+                chars.append(ch)
+            rows.append("".join(chars))
+        return "\n".join(rows)
 
     def row(self, n: int) -> str:
         """Get a specific row's text (0-indexed)."""
         if 0 <= n < self._screen.lines:
-            return self._screen.display[n].rstrip()
+            return self._screen.display[n]
         return ""
 
     @property
@@ -147,9 +207,12 @@ class ScreenReader:
         self._session.send_keys(keys)
 
     def resize(self, cols: int, rows: int) -> None:
-        """Resize the terminal. Only works as Writer."""
+        """Resize the terminal. Only works as Writer.
+
+        Note: local screen resize happens when poll() receives ResizeAck,
+        not immediately.
+        """
         self._session.resize(cols, rows)
-        self._screen.resize(rows, cols)
 
     def close(self) -> None:
         """Close the connection."""
