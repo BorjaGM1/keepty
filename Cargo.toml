@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["BorjaGM1"]
@@ -15,7 +15,7 @@ description = "Persistent PTY sessions with a typed binary protocol"
 repository = "https://github.com/BorjaGM1/keepty"
 
 [workspace.dependencies]
-keepty-protocol = { version = "0.1.0", path = "keepty-protocol" }
+keepty-protocol = { version = "0.1.1", path = "keepty-protocol" }
 portable-pty = "0.8"
 vt100 = "0.15"
 nix = "0.29"
