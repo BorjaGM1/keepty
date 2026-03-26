@@ -10,6 +10,7 @@ mod attach;
 mod broker;
 
 use keepty_protocol::socket_path;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -143,10 +144,19 @@ fn cmd_start(args: &[String]) -> i32 {
     cmd.arg("--");
     cmd.args(&command_parts);
 
-    // Detach: redirect stdio, spawn in background
+    // Broker is a long-lived daemon. Put it in its own session so
+    // shell/job-control hangups (SIGHUP) do not kill it.
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     match cmd.spawn() {
         Ok(_child) => {

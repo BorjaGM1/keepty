@@ -174,11 +174,12 @@ fn terminate_child_group(pty_pid: u32) {
 /// Global write-end of signal self-pipe.
 static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn signal_handler(_sig: libc::c_int) {
+extern "C" fn signal_handler(sig: libc::c_int) {
     let fd = SIGNAL_PIPE_WRITE.load(Ordering::SeqCst);
     if fd >= 0 {
+        let sig_byte = sig as u8;
         unsafe {
-            libc::write(fd, b"x" as *const u8 as *const libc::c_void, 1);
+            libc::write(fd, &sig_byte as *const u8 as *const libc::c_void, 1);
         }
     }
 }
@@ -374,6 +375,16 @@ pub fn run() -> Result<()> {
                 signal::SigSet::empty(),
             ),
         )?;
+        // Catch SIGHUP so the broker survives terminal hangup.
+        // Don't use SIG_IGN — ignored dispositions survive exec into the child.
+        signal::sigaction(
+            Signal::SIGHUP,
+            &signal::SigAction::new(
+                signal::SigHandler::Handler(signal_handler),
+                signal::SaFlags::SA_RESTART,
+                signal::SigSet::empty(),
+            ),
+        )?;
     }
     SIGNAL_PIPE_WRITE.store(sig_write_fd.into_raw_fd(), Ordering::SeqCst);
 
@@ -522,12 +533,19 @@ pub fn run() -> Result<()> {
             )
         };
         if n > 0 {
-            log("Received SIGTERM/SIGINT");
-            state.running.store(false, Ordering::SeqCst);
-            let pid = state.pty_pid.load(Ordering::SeqCst);
-            terminate_child_group(pid);
-            exit_code = 143;
-            break;
+            match sig_buf[0] as libc::c_int {
+                libc::SIGHUP => {
+                    log("Received SIGHUP; ignoring (broker is a daemon)");
+                }
+                _ => {
+                    log("Received SIGTERM/SIGINT");
+                    state.running.store(false, Ordering::SeqCst);
+                    let pid = state.pty_pid.load(Ordering::SeqCst);
+                    terminate_child_group(pid);
+                    exit_code = 143;
+                    break;
+                }
+            }
         }
 
         thread::sleep(std::time::Duration::from_millis(100));
