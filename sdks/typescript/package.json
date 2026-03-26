@@ -1,6 +1,6 @@
 {
   "name": "keepty",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript SDK for keepty — persistent terminal sessions with a typed binary protocol",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
