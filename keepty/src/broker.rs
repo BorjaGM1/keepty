@@ -836,14 +836,16 @@ fn handle_client(
                 // Preserve primary-screen scrollback for every role.
                 out.ring.recent()
             };
-            // Restore authoritative input modes after ring replay, whose oldest mode
-            // sequences may have rolled out of the history.
-            let mut replay_data = replay_data;
-            if role == Role::Writer {
-                replay_data.extend(screen.screen().input_mode_formatted());
-            }
             for encoded in replay_frames(&replay_data) {
                 let _ = tx.try_send(encoded);
+            }
+            if role == Role::Writer {
+                // A wrapped ring can end inside an escape sequence. Cancel it
+                // before restoring the current modes in a separate, small frame.
+                // Keep this after replay so stale mode toggles cannot override it.
+                let mut modes = vec![0x18]; // CAN resets the terminal parser state
+                modes.extend(screen.screen().input_mode_formatted());
+                let _ = tx.try_send(Frame::new(MsgKind::Output, modes).encode().into());
             }
 
             out.clients.insert(client_id, ClientSender { tx, role });
@@ -1040,9 +1042,16 @@ fn handle_client(
             MsgKind::Ping => {
                 let pong = Frame::new(MsgKind::Pong, Vec::new());
                 let encoded: Arc<[u8]> = pong.encode().into();
-                let out = state.output.lock().unwrap();
-                if let Some(client) = out.clients.get(&client_id) {
-                    let _ = client.tx.try_send(encoded);
+                let tx = {
+                    let out = state.output.lock().unwrap();
+                    out.clients.get(&client_id).map(|client| client.tx.clone())
+                };
+                // Preserve the acknowledgement under backpressure without holding
+                // the output lock while the drain thread frees queue space.
+                if let Some(tx) = tx {
+                    if tx.send(encoded).is_err() {
+                        break;
+                    }
                 }
             }
             _ => {}

@@ -684,7 +684,18 @@ where
         Frame::new(MsgKind::Output, replay)
             .write_to(&mut stream)
             .unwrap();
+        let ping = Frame::read_from(&mut stream).unwrap().unwrap();
+        assert_eq!(ping.kind, MsgKind::Ping);
+        Frame::new(MsgKind::Pong, vec![])
+            .write_to(&mut stream)
+            .unwrap();
         check(&mut stream);
+        let ping = Frame::read_from(&mut stream).unwrap().unwrap();
+        assert_eq!(ping.kind, MsgKind::Ping);
+        Frame::new(MsgKind::Pong, vec![])
+            .write_to(&mut stream)
+            .unwrap();
+        assert!(Frame::read_from(&mut stream).unwrap().is_none());
     });
     let mut cli_args = vec![args[0], &id];
     cli_args.extend_from_slice(&args[1..]);
@@ -713,7 +724,6 @@ fn cli_send_paste_and_separate_delayed_submit() {
     );
     cli_peer("cli-raw", &["send", "hello"], b"ready", |stream| {
         assert_eq!(Frame::read_from(stream).unwrap().unwrap().payload, b"hello");
-        assert!(Frame::read_from(stream).unwrap().is_none());
     });
 }
 
@@ -1039,5 +1049,47 @@ fn cli_wait_matches_final_output_before_exit_and_screen_reports_exit() {
             output.status.code(),
             Some(if command == "wait" { 0 } else { 3 })
         );
+    }
+}
+
+#[test]
+fn cli_send_restores_old_paste_mode_and_delivers_submit_before_exit() {
+    // Model a TUI that enabled bracketed paste once, then produced enough output
+    // to evict that DECSET from the ring. Raw bursts must never reach this app.
+    for text in ["single line with spaces", "first line\nsecond line"] {
+        let id = unique_id("cli-old-paste-mode");
+        let child = start_broker(
+            &id,
+            r#"stty raw -echo; python3 -u -c 'import os,time
+os.write(1,b"\x1b[?2004h\x1b[?1h")
+os.write(1,b"x"*(1048576+65536))
+os.write(1,b"\r\nREADY\r\n\x1b]0;unfinished")
+a=os.read(0,4096); t=time.monotonic_ns()
+os.write(1,b"TEXT:"+a.hex().encode()+b"\r\n")
+b=os.read(0,4096); cr=time.monotonic_ns()
+assert a.startswith(b"\x1b[200~") and a.endswith(b"\x1b[201~"),a
+assert b==b"\r",b
+assert cr-t >= 100000000
+os.write(1,b"CR_OK\r\n")
+time.sleep(30)'"#,
+        );
+        let mut writer = connect(&id, Role::Writer);
+        let output = read_until_output_contains(&mut writer, "READY", Duration::from_secs(10));
+        assert!(output.contains("READY"));
+        let result = agent_cli(&["send", &id, text, "--submit", "--submit-delay", "200"]);
+        assert!(result.status.success(), "{result:?}");
+        let received = read_until_output_contains(&mut writer, "CR_OK", Duration::from_secs(5));
+        let expected = format!("\x1b[200~{text}\x1b[201~");
+        let hex: String = expected
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(received.contains(&format!("TEXT:{hex}")), "{received}");
+        // The child reports success only after checking paste, CR, and their
+        // gap on its own clock. Allow the same five-second deadline as sync
+        // for the child to run after the broker has acknowledged the PTY write.
+        assert!(received.contains("CR_OK"), "{received}");
+        cleanup(child, &id);
     }
 }

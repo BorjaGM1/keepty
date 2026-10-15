@@ -36,6 +36,7 @@ pub struct ScreenReader {
     pty_pid: u32,
     read_buffer: Vec<u8>,
     exited: bool,
+    pongs: u64,
 }
 
 impl ScreenReader {
@@ -88,6 +89,7 @@ impl ScreenReader {
             pty_pid,
             read_buffer,
             exited: false,
+            pongs: 0,
         };
 
         // Preserve replay, including a leading Exit, without a two-second idle wait.
@@ -168,6 +170,9 @@ impl ScreenReader {
                 }
                 MsgKind::Ping => {
                     Frame::new(MsgKind::Pong, vec![]).write_to(&mut self.stream)?;
+                }
+                MsgKind::Pong => {
+                    self.pongs += 1;
                 }
                 MsgKind::Exit => {
                     self.exited = true;
@@ -276,6 +281,29 @@ impl ScreenReader {
         frame.write_to(&mut self.stream)
     }
 
+    /// Wait for the broker to process all preceding input and queued replay.
+    /// Uses the existing ordered Ping/Pong messages; this acknowledges forwarding
+    /// to the PTY, not application-level acceptance of the input.
+    pub fn sync(&mut self, timeout: Duration) -> io::Result<()> {
+        let before = self.pongs;
+        Frame::new(MsgKind::Ping, vec![]).write_to(&mut self.stream)?;
+        let started = std::time::Instant::now();
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "broker input acknowledgement timed out",
+                ));
+            }
+            let result = self.poll(remaining.min(Duration::from_millis(20)));
+            if self.pongs != before {
+                return Ok(());
+            }
+            result?;
+        }
+    }
+
     /// Send a resize request. Only works if connected as Writer.
     /// The parser size updates when poll() receives the broker's ResizeAck.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
@@ -318,6 +346,7 @@ mod tests {
                 pty_pid: 1234,
                 read_buffer: Vec::new(),
                 exited: false,
+                pongs: 0,
             },
             peer,
         )
@@ -582,5 +611,28 @@ mod tests {
             reader.poll(Duration::from_millis(5)).unwrap_err().kind(),
             std::io::ErrorKind::ConnectionAborted
         );
+    }
+    #[test]
+    fn sync_waits_for_ordered_pong_after_input() {
+        let (mut reader, mut peer) = reader_with_peer(Role::Writer, 80, 24);
+        let (tx, rx) = std::sync::mpsc::channel();
+        reader.send_keys(b"\r").unwrap();
+        let client = std::thread::spawn(move || {
+            tx.send(reader.sync(Duration::from_secs(1))).unwrap();
+        });
+        assert_eq!(Frame::read_from(&mut peer).unwrap().unwrap().payload, b"\r");
+        assert_eq!(
+            Frame::read_from(&mut peer).unwrap().unwrap().kind,
+            MsgKind::Ping
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        Frame::new(MsgKind::Pong, vec![])
+            .write_to(&mut peer)
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        client.join().unwrap();
     }
 }

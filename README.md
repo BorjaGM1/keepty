@@ -62,10 +62,11 @@ keepty wait agent --quiet 1000 --timeout 30
 `screen` and `wait` connect as Monitor without resizing or requesting a redraw;
 the screen parser uses the broker's actual dimensions; `screen --cols/--rows`
 are accepted compatibility hints and do not change the snapshot dimensions. Screen lines have trailing
-whitespace stripped. `send` connects as Writer and wraps text containing newlines
-or carriage returns in bracketed paste when the application enables that mode.
+whitespace stripped. `send` connects as Writer and wraps all text (including single lines) in
+bracketed paste when the application enables that mode.
 Otherwise it sends raw text. `--submit` sends a separate carriage return after the delay
-(in milliseconds, default 1000, minimum 50). Output is drained during the delay. `keys` accepts `enter`, `tab`, `esc`, `backspace`,
+(in milliseconds, default 1000, minimum 50). Output is drained during the delay, and the CLI waits for the broker to forward
+the final Enter before exiting. `keys` accepts `enter`, `tab`, `esc`, `backspace`,
 `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`,
 `f1`–`f12`, `ctrl-a`–`ctrl-z`, and `space`. Names are case-insensitive;
 `return`, `escape`, `page-up`, and `page-down` are aliases. Unknown keys exit with code 2.

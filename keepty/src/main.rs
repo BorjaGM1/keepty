@@ -462,10 +462,8 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
         }
         "send" => {
             let text = text.unwrap();
-            reader.poll(Duration::from_millis(30))?;
-            let payload = if (text.contains('\n') || text.contains('\r'))
-                && reader.screen().bracketed_paste()
-            {
+            reader.sync(Duration::from_secs(5))?;
+            let payload = if reader.screen().bracketed_paste() {
                 format!("\x1b[200~{text}\x1b[201~")
             } else {
                 text
@@ -482,9 +480,10 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 }
                 reader.send_keys(b"\r")?;
             }
+            reader.sync(Duration::from_secs(5))?;
         }
         "keys" => {
-            reader.poll(Duration::from_millis(30))?;
+            reader.sync(Duration::from_secs(5))?;
             for (name, key) in args[1..].iter().zip(keys) {
                 let key = if reader.screen().application_cursor() {
                     named_key(name, true).unwrap()
@@ -493,6 +492,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 };
                 reader.send_keys(&key)?;
             }
+            reader.sync(Duration::from_secs(5))?;
         }
         "wait" => {
             let normalize = |s: String| {
