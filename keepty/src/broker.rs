@@ -597,7 +597,7 @@ pub fn run() -> Result<()> {
         let exit_frame = Frame::new(MsgKind::Exit, encode_exit(exit_code));
         let encoded: Arc<[u8]> = exit_frame.encode().into();
         let mut out = state.output.lock().unwrap();
-        for (_, client) in out.clients.iter() {
+        for client in out.clients.values() {
             // Use blocking send for Exit — we want it delivered, not dropped
             let _ = client.tx.send(encoded.clone());
         }
