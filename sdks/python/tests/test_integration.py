@@ -826,3 +826,40 @@ class TestScreenIntegration:
                 _expect_got(reader, "7a0d")
         finally:
             cleanup(child, sid)
+
+
+@pytest.mark.parametrize("command", [
+    "sh -c 'echo a b'",
+    ["sh", "-c", "echo a b"],
+    ("sh", "-c", "echo a b"),
+])
+def test_start_preserves_quoted_arguments(command, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from keepty import start
+    from keepty import client
+
+    run = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(client.subprocess, "run", run)
+    monkeypatch.setattr(client.os.path, "exists", lambda path: True)
+    start("quoted", command=command, keepty_bin="/test/keepty")
+    run.assert_called_once_with(
+        ["/test/keepty", "start", "quoted", "--", "sh", "-c", "echo a b"],
+        capture_output=True, text=True,
+    )
+
+
+def test_start_argument_list_is_not_split_or_mutated(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from keepty import start
+    from keepty import client
+
+    command = ["program with spaces", "", "literal 'quotes'", "a b"]
+    original = command.copy()
+    run = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(client.subprocess, "run", run)
+    monkeypatch.setattr(client.os.path, "exists", lambda path: True)
+    start("args", command=command, keepty_bin="/test/keepty")
+    assert command == original
+    assert run.call_args.args[0] == ["/test/keepty", "start", "args", "--", *original]

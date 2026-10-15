@@ -6,6 +6,7 @@ import os
 import select
 import socket
 import shutil
+import shlex
 import subprocess
 import time
 from typing import Optional
@@ -255,7 +256,7 @@ class SessionExited(Exception):
 
 def start(
     session_id: str,
-    command: Optional[str] = None,
+    command: Optional[str | list[str] | tuple[str, ...]] = None,
     working_dir: Optional[str] = None,
     keepty_bin: Optional[str] = None,
 ) -> None:
@@ -263,13 +264,18 @@ def start(
 
     Args:
         session_id: Unique session identifier.
-        command: Command to run (default: user's shell).
+        command: Command string parsed with shlex.split, or a list/tuple of
+            arguments passed unchanged (default: user's shell). Shell operators
+            require an explicit shell, e.g. "sh -c 'echo a b'". Only the list/tuple
+            form preserves spaces and backslashes literally; strings use POSIX
+            quoting and escapes, without expanding ~ or environment variables.
         working_dir: Working directory for the command.
         keepty_bin: Path to keepty binary (default: found in PATH).
 
     Raises:
         FileNotFoundError: If keepty binary not found.
         RuntimeError: If session fails to start.
+        ValueError: If a command string has unclosed quotes or invalid escapes.
     """
     bin_path = keepty_bin or shutil.which("keepty")
     if not bin_path:
@@ -281,7 +287,8 @@ def start(
     if working_dir:
         args.extend(["--working-dir", working_dir])
     if command:
-        args.extend(["--", command])
+        args.append("--")
+        args.extend(shlex.split(command) if isinstance(command, str) else command)
 
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:

@@ -4,10 +4,14 @@ keepty screen — agent screen-reading layer.
 Connects to a keepty broker as Monitor, feeds the raw byte stream
 into a terminal parser (pyte), and exposes parsed screen state.
 
-Requires: pip install pyte
+Requires screen extras in the running Python environment. Install with:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "keepty[screen]"])
 """
 
 import math
+import shlex
+import sys
 import time
 from numbers import Real
 from typing import Optional
@@ -166,7 +170,8 @@ def _load_pyte():
         import pyte
     except ImportError as exc:
         raise ImportError(
-            "pyte is required for screen reading. Install it: pip install pyte"
+            "pyte is required for screen reading. Install it in this Python environment: "
+            f"{shlex.quote(sys.executable)} -m pip install 'keepty[screen]'"
         ) from exc
     return pyte
 

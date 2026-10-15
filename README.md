@@ -34,11 +34,16 @@ cargo install keepty
 ### SDKs
 
 ```bash
-pip install keepty          # Python
+# Python: install into an isolated environment (also works with PEP 668)
+python3 -m venv ~/.venvs/keepty && ~/.venvs/keepty/bin/pip install keepty
+# Run SDK scripts with ~/.venvs/keepty/bin/python, or activate the environment:
+source ~/.venvs/keepty/bin/activate
 npm install keepty          # TypeScript / Node
 go get github.com/BorjaGM1/keepty/sdks/go  # Go
 dotnet add package Keepty   # .NET
 ```
+
+On Debian/Ubuntu, install `python3-venv` first if creating the environment fails.
 
 #### Agent usage
 
@@ -70,7 +75,9 @@ unchanged screen, 1 on timeout, or 3 when the session exits. Quiet detection
 ignores changes between braille spinner characters (U+2800–U+28FF).
 
 
-Install `pip install 'keepty[screen]'` and start a session (for example,
+Install screen support into the same environment with
+`~/.venvs/keepty/bin/pip install 'keepty[screen]'` and run the example with
+`~/.venvs/keepty/bin/python`. Start a session (for example,
 `keepty start agent --detach -- codex`), then drive it as Writer:
 
 ```python
