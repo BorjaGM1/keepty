@@ -20,7 +20,7 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  keepty start <session-id> [-- <command...>]");
     eprintln!("  keepty attach <session-id> [--watch]");
-    eprintln!("  keepty screen <id> [--cols N --rows N]");
+    eprintln!("  keepty screen <id> [--cols N --rows N] [--scrollback [N]]");
     eprintln!(
         "  keepty send <id> <text> [--submit] [--submit-delay MS (default 1000, minimum 50)]"
     );
@@ -382,6 +382,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
     let mut timeout = 30u64;
     let mut text = None;
     let mut quiet = None;
+    let mut history = None;
     let mut keys = Vec::new();
     if command == "keys" {
         if args.len() < 2 {
@@ -404,6 +405,12 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
             let option = args[i].as_str();
             if option == "--submit" && command == "send" {
                 submit = true;
+            } else if option == "--scrollback" && command == "screen" {
+                history = Some(1000);
+                if let Some(value) = args.get(i + 1).filter(|s| !s.starts_with("--")) {
+                    history = Some(value.parse::<usize>().map_err(|_| invalid())?);
+                    i += 1;
+                }
             } else {
                 i += 1;
                 let value = args.get(i).ok_or_else(invalid)?;
@@ -446,18 +453,33 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
         let monitor = ScreenReader::connect(&socket_path(id), Role::Monitor)?;
         (rows, cols) = monitor.size();
     }
-    let mut reader = ScreenReader::connect_with_size(&socket_path(id), role, cols, rows)?;
+    let mut reader = ScreenReader::connect_with_size_and_history(
+        &socket_path(id),
+        role,
+        cols,
+        rows,
+        history.unwrap_or(0),
+    )?;
     let started = Instant::now();
     match command {
         "screen" => {
-            // Drain additional replay frames, with a bounded window for live output.
-            match reader.poll(Duration::from_millis(20)) {
+            // Synchronize history replay; preserve the default screen polling behavior.
+            let replay = if history.is_some() {
+                reader.sync(Duration::from_secs(5))
+            } else {
+                reader.poll(Duration::from_millis(20)).map(|_| ())
+            };
+            match replay {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::ConnectionAborted => return Ok(3),
                 Err(e) => return Err(e),
             }
-            for line in reader.contents().lines() {
-                println!("{}", line.trim_end());
+            if history.is_some() {
+                println!("{}", reader.history_contents());
+            } else {
+                for line in reader.contents().lines() {
+                    println!("{}", line.trim_end());
+                }
             }
         }
         "send" => {

@@ -706,6 +706,49 @@ where
 }
 
 #[test]
+fn cli_screen_scrollback_replays_numbered_lines() {
+    let id = unique_id("cli-scrollback");
+    let child = start_broker(
+        &id,
+        r#"python3 -u -c 'import time
+for i in range(1,201): print("line-%04d   " % i)
+time.sleep(30)'"#,
+    );
+    let mut writer = connect(&id, Role::Writer);
+    assert!(
+        read_until_output_contains(&mut writer, "line-0200", Duration::from_secs(5))
+            .contains("line-0200")
+    );
+    let default = agent_cli(&["screen", &id]);
+    assert!(default.status.success(), "{default:?}");
+    let visible = String::from_utf8(default.stdout).unwrap();
+    assert!(!visible.contains("line-0001"), "{visible}");
+    assert!(visible.contains("line-0200"), "{visible}");
+    for options in [
+        vec!["screen", &id, "--scrollback"],
+        vec!["screen", &id, "--scrollback", "1000"],
+    ] {
+        let output = agent_cli(&options);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            &lines[..200],
+            &(1..=200)
+                .map(|i| format!("line-{i:04}"))
+                .collect::<Vec<_>>()
+        );
+    }
+    let output = agent_cli(&["screen", &id, "--scrollback", "5"]);
+    assert!(output.status.success(), "{output:?}");
+    let limited = String::from_utf8(output.stdout).unwrap();
+    assert!(!limited.contains("line-0001"));
+    assert!(limited.contains("line-0200"));
+    assert_eq!(limited.lines().count(), 29);
+    cleanup(child, &id);
+}
+
+#[test]
 fn cli_send_paste_and_separate_delayed_submit() {
     cli_peer(
         "cli-send",

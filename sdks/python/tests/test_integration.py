@@ -863,3 +863,32 @@ def test_start_argument_list_is_not_split_or_mutated(monkeypatch):
     start("args", command=command, keepty_bin="/test/keepty")
     assert command == original
     assert run.call_args.args[0] == ["/test/keepty", "start", "args", "--", *original]
+
+
+def test_screen_history_replays_numbered_lines(keepty_bin):
+    pytest.importorskip("pyte")
+    from keepty.screen import ScreenReader
+
+    session_id = unique_id("screen-history")
+    child = start_broker(session_id, "python3 -u -c 'import time; "
+                         "[print(\"line-%04d   \" % i) for i in range(1,201)]; time.sleep(30)'")
+    try:
+        with ScreenReader.connect(session_id, role=Role.WRITER) as visible:
+            assert visible.poll_until("line-0200", timeout=5), visible.contents()
+            assert "line-0001" not in visible.contents()
+            assert visible.history_contents() == "\n".join(
+                row.rstrip() for row in visible.contents().split("\n")
+            )
+            with ScreenReader.connect(session_id, history=1000) as reader:
+                lines = reader.history_contents().splitlines()
+                assert lines[:200] == [f"line-{i:04}" for i in range(1, 201)]
+                assert "line-0001" not in reader.contents()
+                assert "line-0200" in reader.contents()
+                assert reader.history_contents().splitlines() == lines
+            with ScreenReader.connect(session_id, history=5) as reader:
+                lines = reader.history_contents().split("\n")
+                assert len(lines) == 29
+                assert "line-0001" not in lines
+                assert "line-0200" in lines
+    finally:
+        cleanup(child, session_id)

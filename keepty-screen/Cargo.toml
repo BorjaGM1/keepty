@@ -9,4 +9,5 @@ repository.workspace = true
 
 [dependencies]
 keepty-protocol = { workspace = true }
-vt100 = { workspace = true }
+# 0.16.2 fixes scrolling farther back than the visible screen height.
+vt100 = "0.16.2"

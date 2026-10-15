@@ -177,20 +177,27 @@ def _load_pyte():
 
 
 _PARSER_CLASSES = None
+_HISTORY_PARSER_CLASSES = None
 
 
-def _parser_classes():
+def _parser_classes(history=False):
     """Return ``(screen_cls, stream_cls)``, importing pyte on first use."""
-    global _PARSER_CLASSES
+    global _PARSER_CLASSES, _HISTORY_PARSER_CLASSES
+    if history:
+        if _HISTORY_PARSER_CLASSES is None:
+            _HISTORY_PARSER_CLASSES = _build_parser_classes(history=True)
+        return _HISTORY_PARSER_CLASSES
     if _PARSER_CLASSES is None:
         _PARSER_CLASSES = _build_parser_classes()
     return _PARSER_CLASSES
 
 
-def _build_parser_classes():
+def _build_parser_classes(history=False):
     pyte = _load_pyte()
 
-    class TolerantScreen(pyte.Screen):
+    base = pyte.HistoryScreen if history else pyte.Screen
+
+    class TolerantScreen(base):
         """pyte screen that ignores private SGR instead of raising.
 
         pyte's stream calls ``select_graphic_rendition(*params, private=True)``
@@ -280,6 +287,7 @@ class ScreenReader:
         role: Role = Role.MONITOR,
         cols: int = 80,
         rows: int = 24,
+        history: int = 0,
     ) -> "ScreenReader":
         """Connect to a session with screen parsing.
 
@@ -288,6 +296,7 @@ class ScreenReader:
             role: Monitor (read-only, default) or Writer (can interact).
             cols: Requested terminal columns (broker may use different size).
             rows: Requested terminal rows (broker may use different size).
+            history: Maximum scrollback lines to retain (default: none).
 
         Returns:
             A connected ScreenReader.
@@ -295,7 +304,9 @@ class ScreenReader:
         Raises:
             ImportError: If pyte is not installed.
         """
-        screen_cls, stream_cls = _parser_classes()
+        if not isinstance(history, int) or history < 0:
+            raise ValueError("history must be a nonnegative integer")
+        screen_cls, stream_cls = _parser_classes(history=history > 0)
 
         session = Session.connect(session_id, role=role, cols=cols, rows=rows)
 
@@ -303,7 +314,8 @@ class ScreenReader:
         ack_cols = session._cols
         ack_rows = session._rows
 
-        screen = screen_cls(ack_cols, ack_rows)
+        screen = (screen_cls(ack_cols, ack_rows, history=history)
+                  if history else screen_cls(ack_cols, ack_rows))
         stream = stream_cls(screen)
 
         reader = cls(session, screen, stream)
@@ -441,6 +453,19 @@ class ScreenReader:
         a representation that marks styled cells.
         """
         return "\n".join(self._screen.display)
+
+    def history_contents(self) -> str:
+        """Return retained scrollback then visible rows, oldest first, right-trimmed."""
+        history = getattr(self._screen, "history", None)
+        lines = []
+        if history is not None:
+            for row in history.top:
+                lines.append("".join(
+                    row[x].data if x in row else " "
+                    for x in range(self._screen.columns)
+                ).rstrip())
+        lines.extend(row.rstrip() for row in self._screen.display)
+        return "\n".join(lines)
 
     def visible_contents(self) -> str:
         """Get screen text with styled spaces marked.

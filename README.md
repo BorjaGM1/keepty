@@ -59,6 +59,18 @@ keepty wait agent --text "Hi" --timeout 30
 keepty wait agent --quiet 1000 --timeout 30
 ```
 
+`keepty screen agent --scrollback` includes up to 1000 retained scrollback lines
+before the visible screen; `--scrollback N` selects another limit (0 keeps only
+the visible screen). Lines are right-trimmed and ordered oldest first. Rust callers
+can use `ScreenReader::connect_with_history(path, role, N)` and
+`history_contents()`; Python callers can use
+`ScreenReader.connect("agent", history=N)` and `history_contents()`.
+Defaults retain no scrollback, and `wait --text` still searches only the visible
+screen. This uses the existing replay with no protocol change. History is limited
+to primary-screen output and the broker's 1 MB ring; full-screen apps using the
+alternate screen manage their own scrollback, which is not exposed here. Older
+output evicted from the ring cannot be recovered by requesting more lines.
+
 `screen` and `wait` connect as Monitor without resizing or requesting a redraw;
 the screen parser uses the broker's actual dimensions; `screen --cols/--rows`
 are accepted compatibility hints and do not change the snapshot dimensions. Screen lines have trailing

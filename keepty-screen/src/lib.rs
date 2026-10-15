@@ -56,6 +56,17 @@ impl ScreenReader {
         cols: u16,
         rows: u16,
     ) -> io::Result<Self> {
+        Self::connect_with_size_and_history(socket_path, role, cols, rows, 0)
+    }
+
+    /// Connect with a requested size and retain up to `history` scrollback lines.
+    pub fn connect_with_size_and_history(
+        socket_path: &str,
+        role: Role,
+        cols: u16,
+        rows: u16,
+        history: usize,
+    ) -> io::Result<Self> {
         let mut stream = UnixStream::connect(socket_path)?;
         stream.set_nonblocking(false)?;
 
@@ -80,7 +91,7 @@ impl ScreenReader {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid HelloAck payload")
             })?;
 
-        let parser = vt100::Parser::new(ack_rows, ack_cols, 0);
+        let parser = vt100::Parser::new(ack_rows, ack_cols, history);
 
         let mut reader = Self {
             stream,
@@ -107,11 +118,16 @@ impl ScreenReader {
         Self::connect_with_size(socket_path, role, 80, 24)
     }
 
+    /// Connect with default requested size and retain up to `history` scrollback lines.
+    pub fn connect_with_history(socket_path: &str, role: Role, history: usize) -> io::Result<Self> {
+        Self::connect_with_size_and_history(socket_path, role, 80, 24, history)
+    }
+
     fn apply_resize_ack(&mut self, payload: &[u8]) -> io::Result<()> {
         let (_gen, cols, rows) = protocol::decode_resize_ack(payload).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid ResizeAck payload")
         })?;
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
         Ok(())
     }
 
@@ -234,6 +250,24 @@ impl ScreenReader {
     /// Get the full text content of the screen (all rows joined with newlines).
     pub fn contents(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    /// Return retained scrollback followed by visible rows, oldest first.
+    /// Each physical row is right-trimmed; the live parser view is unchanged.
+    pub fn history_contents(&self) -> String {
+        let mut screen = self.parser.screen().clone();
+        let (_, cols) = screen.size();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        let mut lines = Vec::new();
+        for offset in (1..=history).rev() {
+            screen.set_scrollback(offset);
+            let row = screen.rows(0, cols).next().unwrap_or_default();
+            lines.push(row.trim_end().to_owned());
+        }
+        screen.set_scrollback(0);
+        lines.extend(screen.rows(0, cols).map(|row| row.trim_end().to_owned()));
+        lines.join("\n")
     }
 
     /// Get the text content of a specific row (0-indexed).
@@ -541,7 +575,7 @@ mod tests {
         let frame = Frame::read_from(&mut stream).unwrap().unwrap();
         assert_eq!(frame.kind, MsgKind::ResizeAck);
         let (_gen, cols, rows) = protocol::decode_resize_ack(&frame.payload).unwrap();
-        parser.set_size(rows, cols);
+        parser.screen_mut().set_size(rows, cols);
 
         // Parser should now reflect the ResizeAck dimensions
         assert_eq!(parser.screen().size(), (50, 132));
