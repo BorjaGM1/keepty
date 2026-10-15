@@ -91,6 +91,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "keepty-protocol",
+ "keepty-screen",
  "libc",
  "nix 0.29.0",
  "portable-pty",

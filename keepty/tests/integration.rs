@@ -602,3 +602,442 @@ fn list_prunes_refused_sockets_and_preserves_live_sessions() {
     assert!(live.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn agent_cli(args: &[&str]) -> std::process::Output {
+    Command::new(keepty_bin()).args(args).output().unwrap()
+}
+
+#[test]
+fn cli_screen_replays_without_resize_or_redraw() {
+    let id = unique_id("cli-screen");
+    let child = start_broker(
+        &id,
+        "trap 'echo REDRAW' WINCH; printf '\\033[31mready   \\033[0m'; sleep 30",
+    );
+    let mut writer = connect(&id, Role::Writer);
+    assert!(
+        read_until_output_contains(&mut writer, "ready", Duration::from_secs(5)).contains("ready")
+    );
+    let output = agent_cli(&["screen", &id, "--cols", "120", "--rows", "40"]);
+    assert!(output.status.success(), "{:?}", output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("ready"));
+    assert!(!text.contains('\x1b'));
+    assert!(!text.contains("REDRAW"));
+    assert!(text.lines().all(|line| line == line.trim_end()));
+    let monitor = connect(&id, Role::Monitor); // helper asserts size remains 80x24
+    drop(monitor);
+    cleanup(child, &id);
+}
+
+// A protocol peer makes Input frame boundaries and submission timing observable.
+fn cli_peer<F>(label: &str, args: &[&str], replay: &[u8], check: F)
+where
+    F: FnOnce(&mut UnixStream) + Send + 'static,
+{
+    use std::os::unix::net::UnixListener;
+    let id = unique_id(label);
+    let path = socket_path(&id);
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let replay = replay.to_vec();
+    let server = std::thread::spawn(move || {
+        let accept = || {
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok(pair) => return pair.0,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && started.elapsed() < Duration::from_secs(5) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("accept timed out or failed: {e}"),
+                }
+            }
+        };
+        let mut monitor = accept();
+        monitor
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let hello = Frame::read_from(&mut monitor).unwrap().unwrap();
+        assert_eq!(decode_hello(&hello.payload).unwrap().0, Role::Monitor);
+        Frame::new(MsgKind::HelloAck, encode_hello_ack(123, 132, 40))
+            .write_to(&mut monitor)
+            .unwrap();
+        Frame::new(MsgKind::Output, b"ready".to_vec())
+            .write_to(&mut monitor)
+            .unwrap();
+        let mut stream = accept();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let hello = Frame::read_from(&mut stream).unwrap().unwrap();
+        assert_eq!(
+            decode_hello(&hello.payload).unwrap(),
+            (Role::Writer, 132, 40)
+        );
+        Frame::new(MsgKind::HelloAck, encode_hello_ack(123, 80, 24))
+            .write_to(&mut stream)
+            .unwrap();
+        Frame::new(MsgKind::Output, replay)
+            .write_to(&mut stream)
+            .unwrap();
+        check(&mut stream);
+    });
+    let mut cli_args = vec![args[0], &id];
+    cli_args.extend_from_slice(&args[1..]);
+    let output = agent_cli(&cli_args);
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(output.status.success(), "{:?}", output);
+}
+
+#[test]
+fn cli_send_paste_and_separate_delayed_submit() {
+    cli_peer(
+        "cli-send",
+        &["send", "one\ntwo", "--submit", "--submit-delay", "150"],
+        b"\x1b[?2004hready",
+        |stream| {
+            let first = Frame::read_from(stream).unwrap().unwrap();
+            assert_eq!(first.kind, MsgKind::Input);
+            assert_eq!(first.payload, b"\x1b[200~one\ntwo\x1b[201~");
+            let started = std::time::Instant::now();
+            let enter = Frame::read_from(stream).unwrap().unwrap();
+            assert_eq!(enter.kind, MsgKind::Input);
+            assert_eq!(enter.payload, b"\r");
+            assert!(started.elapsed() >= Duration::from_millis(120));
+        },
+    );
+    cli_peer("cli-raw", &["send", "hello"], b"ready", |stream| {
+        assert_eq!(Frame::read_from(stream).unwrap().unwrap().payload, b"hello");
+        assert!(Frame::read_from(stream).unwrap().is_none());
+    });
+}
+
+#[test]
+fn cli_keys_encodes_named_keys_and_rejects_unknown() {
+    let names = [
+        "keys",
+        "enter",
+        "tab",
+        "esc",
+        "backspace",
+        "delete",
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10",
+        "f11",
+        "f12",
+        "ctrl-a",
+        "ctrl-z",
+        "space",
+    ];
+    cli_peer("cli-keys", &names, b"ready", |stream| {
+        for expected in [
+            b"\r".as_slice(),
+            b"\t",
+            b"\x1b",
+            b"\x7f",
+            b"\x1b[3~",
+            b"\x1b[A",
+            b"\x1b[B",
+            b"\x1b[D",
+            b"\x1b[C",
+            b"\x1b[H",
+            b"\x1b[F",
+            b"\x1b[5~",
+            b"\x1b[6~",
+            b"\x1bOP",
+            b"\x1bOQ",
+            b"\x1bOR",
+            b"\x1bOS",
+            b"\x1b[15~",
+            b"\x1b[17~",
+            b"\x1b[18~",
+            b"\x1b[19~",
+            b"\x1b[20~",
+            b"\x1b[21~",
+            b"\x1b[23~",
+            b"\x1b[24~",
+            b"\x01",
+            b"\x1a",
+            b" ",
+        ] {
+            let frame = Frame::read_from(stream).unwrap().unwrap();
+            assert_eq!(frame.kind, MsgKind::Input);
+            assert_eq!(frame.payload, expected);
+        }
+    });
+    assert_eq!(
+        agent_cli(&["keys", "missing", "enter", "unknown"])
+            .status
+            .code(),
+        Some(2)
+    );
+    cli_peer(
+        "cli-appkeys",
+        &["keys", "up", "home"],
+        b"\x1b[?1h",
+        |stream| {
+            assert_eq!(
+                Frame::read_from(stream).unwrap().unwrap().payload,
+                b"\x1bOA"
+            );
+            assert_eq!(
+                Frame::read_from(stream).unwrap().unwrap().payload,
+                b"\x1bOH"
+            );
+        },
+    );
+}
+
+#[test]
+fn cli_wait_text_quiet_timeout_and_exit() {
+    let id = unique_id("cli-wait");
+    let child = start_broker(
+        &id,
+        "printf ready; sleep 1; printf '\\r\\033[Kdone'; sleep 30",
+    );
+    let mut writer = connect(&id, Role::Writer);
+    assert!(
+        read_until_output_contains(&mut writer, "ready", Duration::from_secs(5)).contains("ready")
+    );
+    assert!(
+        agent_cli(&["wait", &id, "--text", "done", "--timeout", "5"])
+            .status
+            .success()
+    );
+    assert!(agent_cli(&["wait", &id, "--quiet", "100"]).status.success());
+    assert_eq!(
+        agent_cli(&["wait", &id, "--text", "absent", "--timeout", "1"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        agent_cli(&["wait", &id, "--text", "done", "--quiet", "100"])
+            .status
+            .code(),
+        Some(2)
+    );
+    cleanup(child, &id);
+
+    let id = unique_id("cli-exit");
+    let child = start_broker(&id, "echo ready; sleep 1");
+    let mut writer = connect(&id, Role::Writer);
+    read_until_output_contains(&mut writer, "ready", Duration::from_secs(5));
+    assert_eq!(
+        agent_cli(&["wait", &id, "--text", "absent", "--timeout", "5"])
+            .status
+            .code(),
+        Some(3)
+    );
+    cleanup(child, &id);
+}
+
+#[test]
+fn cli_wait_quiet_ignores_continuous_braille_spinner() {
+    let id = unique_id("cli-spinner");
+    let child = start_broker(
+        &id,
+        "while :; do printf '\\rworking ⠋'; sleep 0.03; printf '\\rworking ⠙'; sleep 0.03; done",
+    );
+    let mut writer = connect(&id, Role::Writer);
+    read_until_output_contains(&mut writer, "working", Duration::from_secs(5));
+    let started = std::time::Instant::now();
+    assert!(
+        agent_cli(&["wait", &id, "--quiet", "200", "--timeout", "2"])
+            .status
+            .success()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(
+        agent_cli(&["wait", &id, "--text", "absent", "--timeout", "1"])
+            .status
+            .code(),
+        Some(1)
+    );
+    cleanup(child, &id);
+}
+
+#[test]
+fn cli_send_real_broker_preserves_size_separates_submit_and_restores_writer() {
+    let id = unique_id("cli-real-send");
+    let child = start_broker(
+        &id,
+        r#"stty raw -echo; python3 -u -c 'import os,time
+print("READY",flush=True)
+a=os.read(0,4096); t=time.monotonic()
+print("FIRST:"+a.hex(),flush=True)
+b=os.read(0,4096)
+assert a==b"hello" and b==b"\r",(a,b)
+assert time.monotonic()-t >= 0.10
+assert os.get_terminal_size(0)==(132,40),os.get_terminal_size(0)
+print("SEPARATE_SIZE_OK",flush=True)
+c=os.read(0,4096)
+assert c==b"z",c
+print("RESTORED",flush=True)
+time.sleep(30)'"#,
+    );
+    let mut writer = UnixStream::connect(socket_path(&id)).unwrap();
+    writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    Frame::new(MsgKind::Hello, encode_hello(Role::Writer, 132, 40))
+        .write_to(&mut writer)
+        .unwrap();
+    let ack = Frame::read_from(&mut writer).unwrap().unwrap();
+    assert_eq!(decode_hello_ack(&ack.payload).unwrap().1, 132);
+    assert!(
+        read_until_output_contains(&mut writer, "READY", Duration::from_secs(5)).contains("READY")
+    );
+    let output = agent_cli(&["send", &id, "hello", "--submit", "--submit-delay", "200"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        read_until_output_contains(&mut writer, "SEPARATE_SIZE_OK", Duration::from_secs(5))
+            .contains("SEPARATE_SIZE_OK")
+    );
+    // Allow the broker's client read thread to observe EOF and restore ownership.
+    std::thread::sleep(Duration::from_millis(100));
+    Frame::new(MsgKind::Input, b"z".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    assert!(
+        read_until_output_contains(&mut writer, "RESTORED", Duration::from_secs(5))
+            .contains("RESTORED")
+    );
+    cleanup(child, &id);
+}
+
+#[test]
+fn cli_wait_changing_letters_timeout_and_invalid_arguments() {
+    let id = unique_id("cli-changing");
+    let child = start_broker(
+        &id,
+        "while :; do printf '\\rA'; sleep 0.03; printf '\\rB'; sleep 0.03; done",
+    );
+    let mut writer = connect(&id, Role::Writer);
+    read_until_output_contains(&mut writer, "A", Duration::from_secs(5));
+    assert_eq!(
+        agent_cli(&["wait", &id, "--quiet", "200", "--timeout", "1"])
+            .status
+            .code(),
+        Some(1)
+    );
+    for args in [
+        vec!["wait", &id, "--quiet", "0"],
+        vec!["wait", &id, "--text", ""],
+        vec!["send", &id, "hello", "--submit-delay", "49"],
+    ] {
+        assert_eq!(agent_cli(&args).status.code(), Some(2));
+    }
+    cleanup(child, &id);
+}
+
+#[test]
+fn cli_send_carriage_return_paste_and_drains_noisy_output() {
+    cli_peer(
+        "cli-cr-paste",
+        &["send", "a\rb", "--submit", "--submit-delay", "200"],
+        b"\x1b[?2004h",
+        |stream| {
+            assert_eq!(
+                Frame::read_from(stream).unwrap().unwrap().payload,
+                b"\x1b[200~a\rb\x1b[201~"
+            );
+            for _ in 0..512 {
+                Frame::new(MsgKind::Output, vec![b'x'; 4096])
+                    .write_to(stream)
+                    .unwrap();
+            }
+            assert_eq!(Frame::read_from(stream).unwrap().unwrap().payload, b"\r");
+        },
+    );
+    cli_peer(
+        "cli-paste-off",
+        &["send", "a\nb"],
+        b"\x1b[?2004l",
+        |stream| {
+            assert_eq!(Frame::read_from(stream).unwrap().unwrap().payload, b"a\nb");
+        },
+    );
+    cli_peer(
+        "cli-aliases",
+        &["keys", "RETURN", "Escape", "PAGE-UP", "Page-Down", "CTRL-Z"],
+        b"",
+        |stream| {
+            for expected in [b"\r".as_slice(), b"\x1b", b"\x1b[5~", b"\x1b[6~", b"\x1a"] {
+                assert_eq!(Frame::read_from(stream).unwrap().unwrap().payload, expected);
+            }
+        },
+    );
+}
+
+#[test]
+fn cli_wait_matches_final_output_before_exit_and_screen_reports_exit() {
+    use std::os::unix::net::UnixListener;
+    for command in ["wait", "screen"] {
+        let id = unique_id("cli-final-output");
+        let path = socket_path(&id);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && started.elapsed() < Duration::from_secs(5) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("accept timed out or failed: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let hello = Frame::read_from(&mut stream).unwrap().unwrap();
+            assert_eq!(decode_hello(&hello.payload).unwrap().0, Role::Monitor);
+            Frame::new(MsgKind::HelloAck, encode_hello_ack(123, 80, 24))
+                .write_to(&mut stream)
+                .unwrap();
+            Frame::new(MsgKind::Output, b"finished".to_vec())
+                .write_to(&mut stream)
+                .unwrap();
+            Frame::new(MsgKind::Exit, encode_exit(0))
+                .write_to(&mut stream)
+                .unwrap();
+        });
+        let output = if command == "wait" {
+            agent_cli(&[command, &id, "--text", "finished"])
+        } else {
+            agent_cli(&[command, &id])
+        };
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if command == "wait" { 0 } else { 3 })
+        );
+    }
+}

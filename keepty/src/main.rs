@@ -20,6 +20,12 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  keepty start <session-id> [-- <command...>]");
     eprintln!("  keepty attach <session-id> [--watch]");
+    eprintln!("  keepty screen <id> [--cols N --rows N]");
+    eprintln!(
+        "  keepty send <id> <text> [--submit] [--submit-delay MS (default 1000, minimum 50)]"
+    );
+    eprintln!("  keepty keys <id> <name>...");
+    eprintln!("  keepty wait <id> (--text STR | --quiet MS) [--timeout SECS (default 30)]");
     eprintln!("  keepty list");
     eprintln!("  keepty stop <session-id>");
     eprintln!();
@@ -340,6 +346,302 @@ fn cmd_stop(args: &[String]) -> i32 {
     0
 }
 
+// Agent commands use ScreenReader so terminal parsing and role negotiation stay shared.
+fn cmd_agent(command: &str, args: &[String]) -> i32 {
+    match run_agent(command, args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
+    use keepty_screen::{Role, ScreenReader};
+    use std::io::{Error, ErrorKind};
+    use std::time::Instant;
+    let invalid = || {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "invalid arguments (see keepty --help)",
+        )
+    };
+    let id = args
+        .first()
+        .filter(|s| !s.starts_with('-'))
+        .ok_or_else(invalid)?;
+    let mut cols = 80u16;
+    let mut rows = 24u16;
+    let mut submit = false;
+    let mut delay = 1000u64;
+    let mut timeout = 30u64;
+    let mut text = None;
+    let mut quiet = None;
+    let mut keys = Vec::new();
+    if command == "keys" {
+        if args.len() < 2 {
+            return Err(invalid());
+        }
+        // Validate every name before connecting or sending any input.
+        for name in &args[1..] {
+            keys.push(named_key(name, false).ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, format!("unknown key: {name}"))
+            })?);
+        }
+    } else {
+        let mut i = if command == "send" {
+            text = Some(args.get(1).ok_or_else(invalid)?.clone());
+            2
+        } else {
+            1
+        };
+        while i < args.len() {
+            let option = args[i].as_str();
+            if option == "--submit" && command == "send" {
+                submit = true;
+            } else {
+                i += 1;
+                let value = args.get(i).ok_or_else(invalid)?;
+                match (command, option) {
+                    ("screen", "--cols") => {
+                        cols = value.parse().ok().filter(|n| *n > 0).ok_or_else(invalid)?
+                    }
+                    ("screen", "--rows") => {
+                        rows = value.parse().ok().filter(|n| *n > 0).ok_or_else(invalid)?
+                    }
+                    ("send", "--submit-delay") => delay = value.parse().map_err(|_| invalid())?,
+                    ("wait", "--timeout") => timeout = value.parse().map_err(|_| invalid())?,
+                    ("wait", "--text") if text.is_none() && quiet.is_none() => {
+                        text = Some(value.clone())
+                    }
+                    ("wait", "--quiet") if text.is_none() && quiet.is_none() => {
+                        quiet = Some(value.parse::<u64>().map_err(|_| invalid())?)
+                    }
+                    _ => return Err(invalid()),
+                }
+            }
+            i += 1;
+        }
+    }
+    if command == "wait" && text.is_none() && quiet.is_none() {
+        return Err(invalid());
+    }
+    if delay < 50
+        || quiet == Some(0)
+        || (command == "wait" && text.as_ref().is_some_and(|t| t.is_empty()))
+    {
+        return Err(invalid());
+    }
+    let role = if command == "send" || command == "keys" {
+        Role::Writer
+    } else {
+        Role::Monitor
+    };
+    if role == Role::Writer {
+        let monitor = ScreenReader::connect(&socket_path(id), Role::Monitor)?;
+        (rows, cols) = monitor.size();
+    }
+    let mut reader = ScreenReader::connect_with_size(&socket_path(id), role, cols, rows)?;
+    let started = Instant::now();
+    match command {
+        "screen" => {
+            // Drain additional replay frames, with a bounded window for live output.
+            match reader.poll(Duration::from_millis(20)) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::ConnectionAborted => return Ok(3),
+                Err(e) => return Err(e),
+            }
+            for line in reader.contents().lines() {
+                println!("{}", line.trim_end());
+            }
+        }
+        "send" => {
+            let text = text.unwrap();
+            reader.poll(Duration::from_millis(30))?;
+            let payload = if (text.contains('\n') || text.contains('\r'))
+                && reader.screen().bracketed_paste()
+            {
+                format!("\x1b[200~{text}\x1b[201~")
+            } else {
+                text
+            };
+            reader.send_keys(payload.as_bytes())?;
+            if submit {
+                let sent = Instant::now();
+                while sent.elapsed() < Duration::from_millis(delay) {
+                    reader.poll(
+                        Duration::from_millis(delay)
+                            .saturating_sub(sent.elapsed())
+                            .min(Duration::from_millis(20)),
+                    )?;
+                }
+                reader.send_keys(b"\r")?;
+            }
+        }
+        "keys" => {
+            reader.poll(Duration::from_millis(30))?;
+            for (name, key) in args[1..].iter().zip(keys) {
+                let key = if reader.screen().application_cursor() {
+                    named_key(name, true).unwrap()
+                } else {
+                    key
+                };
+                reader.send_keys(&key)?;
+            }
+        }
+        "wait" => {
+            let normalize = |s: String| {
+                s.chars()
+                    .map(|c| {
+                        if ('\u{2800}'..='\u{28ff}').contains(&c) {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect::<String>()
+            };
+            let mut previous = normalize(reader.contents());
+            let mut changed = Instant::now();
+            let mut matched = false;
+            loop {
+                if matched || text.as_ref().is_some_and(|t| reader.contents().contains(t)) {
+                    return Ok(0);
+                }
+                if quiet.is_some_and(|ms| changed.elapsed() >= Duration::from_millis(ms)) {
+                    return Ok(0);
+                }
+                let remaining = Duration::from_secs(timeout).saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Ok(1);
+                }
+                let mut interval = remaining.min(Duration::from_millis(20));
+                if let Some(ms) = quiet {
+                    interval =
+                        interval.min(Duration::from_millis(ms).saturating_sub(changed.elapsed()));
+                }
+                match reader.poll_with(interval, |reader| {
+                    matched |= text.as_ref().is_some_and(|t| reader.contents().contains(t));
+                    let current = normalize(reader.contents());
+                    if current != previous {
+                        previous = current;
+                        changed = Instant::now();
+                    }
+                }) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
+                        return Ok(
+                            if matched
+                                || text.as_ref().is_some_and(|t| reader.contents().contains(t))
+                            {
+                                0
+                            } else {
+                                3
+                            },
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+                let current = normalize(reader.contents());
+                if current != previous {
+                    previous = current;
+                    changed = Instant::now();
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(0)
+}
+
+fn named_key(name: &str, application: bool) -> Option<Vec<u8>> {
+    let normalized = name.to_ascii_lowercase();
+    let name = match normalized.as_str() {
+        "return" => "enter",
+        "escape" => "esc",
+        "page-up" => "pageup",
+        "page-down" => "pagedown",
+        name => name,
+    };
+    let bytes: &[u8] = match name {
+        "enter" => b"\r",
+        "tab" => b"\t",
+        "esc" => b"\x1b",
+        "backspace" => b"\x7f",
+        "space" => b" ",
+        "delete" => b"\x1b[3~",
+        "pageup" => b"\x1b[5~",
+        "pagedown" => b"\x1b[6~",
+        "up" => {
+            if application {
+                b"\x1bOA"
+            } else {
+                b"\x1b[A"
+            }
+        }
+        "down" => {
+            if application {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            }
+        }
+        "right" => {
+            if application {
+                b"\x1bOC"
+            } else {
+                b"\x1b[C"
+            }
+        }
+        "left" => {
+            if application {
+                b"\x1bOD"
+            } else {
+                b"\x1b[D"
+            }
+        }
+        "home" => {
+            if application {
+                b"\x1bOH"
+            } else {
+                b"\x1b[H"
+            }
+        }
+        "end" => {
+            if application {
+                b"\x1bOF"
+            } else {
+                b"\x1b[F"
+            }
+        }
+        "f1" => b"\x1bOP",
+        "f2" => b"\x1bOQ",
+        "f3" => b"\x1bOR",
+        "f4" => b"\x1bOS",
+        "f5" => b"\x1b[15~",
+        "f6" => b"\x1b[17~",
+        "f7" => b"\x1b[18~",
+        "f8" => b"\x1b[19~",
+        "f9" => b"\x1b[20~",
+        "f10" => b"\x1b[21~",
+        "f11" => b"\x1b[23~",
+        "f12" => b"\x1b[24~",
+        _ => {
+            let letter = name.strip_prefix("ctrl-")?;
+            if letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic() {
+                return Some(vec![letter.as_bytes()[0].to_ascii_lowercase() - b'a' + 1]);
+            }
+            return None;
+        }
+    };
+    Some(bytes.to_vec())
+}
+
 fn get_terminal_size() -> (u16, u16) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -364,6 +666,7 @@ fn main() {
         "attach" => cmd_attach(&args[2..]),
         "list" | "ls" => cmd_list(),
         "stop" => cmd_stop(&args[2..]),
+        "screen" | "send" | "keys" | "wait" => cmd_agent(&args[1], &args[2..]),
         // Internal: run the broker daemon directly (used by `start` and integration tests)
         "broker" => {
             if let Err(e) = broker::run() {

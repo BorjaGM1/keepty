@@ -40,6 +40,62 @@ go get github.com/BorjaGM1/keepty/sdks/go  # Go
 dotnet add package Keepty   # .NET
 ```
 
+#### Agent usage
+
+The CLI also supports agent workflows without an SDK:
+
+```bash
+keepty screen agent                         # plain text snapshot, read-only
+keepty screen agent --cols 120 --rows 40     # size hints ignored; uses session size
+keepty send agent "say hi" --submit          # separate Enter after 1000 ms
+keepty send agent "say hi" --submit --submit-delay 200
+keepty keys agent ctrl-c up enter
+keepty wait agent --text "Hi" --timeout 30
+keepty wait agent --quiet 1000 --timeout 30
+```
+
+`screen` and `wait` connect as Monitor without resizing or requesting a redraw;
+the screen parser uses the broker's actual dimensions; `screen --cols/--rows`
+are accepted compatibility hints and do not change the snapshot dimensions. Screen lines have trailing
+whitespace stripped. `send` connects as Writer and wraps text containing newlines
+or carriage returns in bracketed paste when the application enables that mode.
+Otherwise it sends raw text. `--submit` sends a separate carriage return after the delay
+(in milliseconds, default 1000, minimum 50). Output is drained during the delay. `keys` accepts `enter`, `tab`, `esc`, `backspace`,
+`delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`,
+`f1`–`f12`, `ctrl-a`–`ctrl-z`, and `space`. Names are case-insensitive;
+`return`, `escape`, `page-up`, and `page-down` are aliases. Unknown keys exit with code 2.
+`screen` exits 3 if the session exits. `wait` requires exactly one of nonempty
+`--text` or positive `--quiet` and exits 0 on a match or
+unchanged screen, 1 on timeout, or 3 when the session exits. Quiet detection
+ignores changes between braille spinner characters (U+2800–U+28FF).
+
+
+Install `pip install 'keepty[screen]'` and start a session (for example,
+`keepty start agent --detach -- codex`), then drive it as Writer:
+
+```python
+from keepty import Role, ScreenReader
+
+with ScreenReader.connect("agent", role=Role.WRITER) as reader:
+    if not reader.exited:
+        reader.send_text("say hi", submit=True)
+    if reader.poll_until("Hi", timeout=30):
+        print(reader.contents())
+    elif reader.exited:
+        print("Session ended:", reader.exit_code)
+    else:
+        print("No matching output yet:", reader.contents())
+```
+
+`poll()` and `poll_until()` record `exited`/`exit_code` instead of raising
+`SessionExited`; the lower-level `Session.read_output()` still raises it.
+`send_text(..., submit=True)` waits 1.0 second before Enter by default.
+Override with `submit_delay=...` (finite, non-negative seconds, including zero)
+or set `reader.submit_delay`. Submission is best-effort and is not acknowledged;
+there are no automatic Enter retries. All text control options are keyword-only.
+Text is not sanitized: embedded control characters and paste-end markers remain
+active input, so arbitrary untrusted text is not safe to send as keystrokes.
+
 ---
 
 ## The problem

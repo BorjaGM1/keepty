@@ -21,7 +21,7 @@
 //! ```
 
 use keepty_protocol::{self as protocol, Frame, MsgKind};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -34,6 +34,8 @@ pub struct ScreenReader {
     parser: vt100::Parser,
     role: Role,
     pty_pid: u32,
+    read_buffer: Vec<u8>,
+    exited: bool,
 }
 
 impl ScreenReader {
@@ -60,13 +62,10 @@ impl ScreenReader {
         let hello = Frame::new(MsgKind::Hello, protocol::encode_hello(role, cols, rows));
         hello.write_to(&mut stream)?;
 
-        // Read HelloAck
-        let ack = Frame::read_from(&mut stream)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed before HelloAck",
-            )
-        })?;
+        // Buffer even the handshake: a timeout must never discard partial bytes.
+        let mut read_buffer = Vec::new();
+        let ack = Self::read_frame(&mut stream, &mut read_buffer, Duration::from_secs(5))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HelloAck timed out"))?;
 
         if ack.kind != MsgKind::HelloAck {
             return Err(io::Error::new(
@@ -87,20 +86,15 @@ impl ScreenReader {
             parser,
             role,
             pty_pid,
+            read_buffer,
+            exited: false,
         };
 
-        // Process one immediately queued frame (ring replay Output or a racey ResizeAck).
-        reader
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(2)))?;
-        if let Ok(Some(frame)) = Frame::read_from(&mut reader.stream) {
-            match frame.kind {
-                MsgKind::Output => reader.parser.process(&frame.payload),
-                MsgKind::ResizeAck => {
-                    reader.apply_resize_ack(&frame.payload)?;
-                }
-                _ => {}
-            }
+        // Preserve replay, including a leading Exit, without a two-second idle wait.
+        match reader.poll(Duration::from_millis(20)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
+            Err(e) => return Err(e),
         }
 
         Ok(reader)
@@ -124,49 +118,112 @@ impl ScreenReader {
     /// Returns the number of frames that changed local parser state
     /// (Output and ResizeAck). Call this in a loop to keep the screen state up to date.
     pub fn poll(&mut self, timeout: Duration) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        let mut count = 0;
+        self.poll_with(timeout, |_| {})
+    }
 
+    /// Poll while observing every parsed Output/ResizeAck, including transient changes.
+    pub fn poll_with<F: FnMut(&Self)>(
+        &mut self,
+        timeout: Duration,
+        mut observe: F,
+    ) -> io::Result<usize> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "poll timeout must be positive",
+            ));
+        }
+        let started = std::time::Instant::now();
+        let mut count = 0;
         loop {
-            match Frame::read_from(&mut self.stream) {
-                Ok(Some(frame)) => match frame.kind {
-                    MsgKind::Output => {
-                        self.parser.process(&frame.payload);
-                        count += 1;
-                    }
-                    MsgKind::ResizeAck => {
-                        self.apply_resize_ack(&frame.payload)?;
-                        count += 1;
-                    }
-                    MsgKind::Ping => {
-                        let pong = Frame::new(MsgKind::Pong, vec![]);
-                        let _ = pong.write_to(&mut self.stream);
-                    }
-                    MsgKind::Exit => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "session exited",
-                        ));
-                    }
-                    _ => {}
-                },
-                Ok(None) => {
+            if self.exited {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "session exited",
+                ));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(count);
+            }
+            let frame = match Self::read_frame(&mut self.stream, &mut self.read_buffer, remaining) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(count),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                    self.exited = true;
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            match frame.kind {
+                MsgKind::Output => {
+                    self.parser.process(&frame.payload);
+                    count += 1;
+                    observe(self);
+                }
+                MsgKind::ResizeAck => {
+                    self.apply_resize_ack(&frame.payload)?;
+                    count += 1;
+                    observe(self);
+                }
+                MsgKind::Ping => {
+                    Frame::new(MsgKind::Pong, vec![]).write_to(&mut self.stream)?;
+                }
+                MsgKind::Exit => {
+                    self.exited = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn read_frame(
+        stream: &mut UnixStream,
+        buffer: &mut Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<Option<Frame>> {
+        let started = std::time::Instant::now();
+        loop {
+            if buffer.len() >= 4 {
+                let len = u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize;
+                if !(2..=protocol::MAX_FRAME_BODY_SIZE).contains(&len) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid frame length",
+                    ));
+                }
+                if buffer.len() >= len + 4 {
+                    let frame = Frame::read_from(&mut &buffer[..len + 4])?;
+                    buffer.drain(..len + 4);
+                    return Ok(frame);
+                }
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            let mut bytes = [0u8; 16384];
+            match stream.read(&mut bytes) {
+                Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "broker disconnected",
-                    ));
+                    ))
                 }
+                Ok(n) => buffer.extend_from_slice(&bytes[..n]),
                 Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
                 {
-                    break;
+                    return Ok(None)
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
         }
-
-        Ok(count)
     }
 
     /// Get the full text content of the screen (all rows joined with newlines).
@@ -259,6 +316,8 @@ mod tests {
                 parser: vt100::Parser::new(rows, cols, 0),
                 role,
                 pty_pid: 1234,
+                read_buffer: Vec::new(),
+                exited: false,
             },
             peer,
         )
@@ -488,5 +547,40 @@ mod tests {
         let (cols, rows) = protocol::decode_resize(&frame.payload).unwrap();
         assert_eq!(cols, 120);
         assert_eq!(rows, 40);
+    }
+    #[test]
+    fn partial_frames_survive_timeouts_and_observers_see_every_change() {
+        use std::io::Write;
+        let (mut reader, mut peer) = reader_with_peer(Role::Monitor, 80, 24);
+        let encoded = Frame::new(MsgKind::Output, b"hello".to_vec()).encode();
+        for byte in &encoded[..encoded.len() - 1] {
+            peer.write_all(&[*byte]).unwrap();
+            assert_eq!(reader.poll(Duration::from_millis(1)).unwrap(), 0);
+        }
+        peer.write_all(&encoded[encoded.len() - 1..]).unwrap();
+        assert_eq!(reader.poll(Duration::from_millis(5)).unwrap(), 1);
+        assert_eq!(reader.contents(), "hello");
+        Frame::new(MsgKind::Output, b"\rworld".to_vec())
+            .write_to(&mut peer)
+            .unwrap();
+        Frame::new(MsgKind::Output, b"\rhello".to_vec())
+            .write_to(&mut peer)
+            .unwrap();
+        let mut states = Vec::new();
+        reader
+            .poll_with(Duration::from_millis(5), |r| states.push(r.contents()))
+            .unwrap();
+        assert_eq!(states, ["world", "hello"]);
+        assert_eq!(
+            reader.poll(Duration::ZERO).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        Frame::new(MsgKind::Exit, protocol::encode_exit(0))
+            .write_to(&mut peer)
+            .unwrap();
+        assert_eq!(
+            reader.poll(Duration::from_millis(5)).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
     }
 }

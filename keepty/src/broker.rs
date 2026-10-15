@@ -119,6 +119,7 @@ struct BrokerState {
 /// Exits when channel disconnects or write fails.
 fn spawn_client_drain(
     client_id: u32,
+    previous_writer_id: u32,
     rx: std::sync::mpsc::Receiver<Arc<[u8]>>,
     mut stream: UnixStream,
     state: Arc<BrokerState>,
@@ -139,9 +140,12 @@ fn spawn_client_drain(
             log(&format!("Client {} disconnected (drain)", client_id));
         }
         drop(out);
-        let _ = state
-            .writer_id
-            .compare_exchange(client_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = state.writer_id.compare_exchange(
+            client_id,
+            previous_writer_id,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         let _ = stream.shutdown(Shutdown::Both);
     })
 }
@@ -641,6 +645,7 @@ fn handle_client(
         decode_hello(&hello_frame.payload).context("Invalid Hello payload")?;
 
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
+    let mut previous_writer_id = 0;
     log(&format!(
         "Client {} connected as {:?} ({}x{})",
         client_id, role, client_cols, client_rows
@@ -716,7 +721,7 @@ fn handle_client(
             *holder = Some(pm);
         }
 
-        state.writer_id.store(client_id, Ordering::SeqCst);
+        previous_writer_id = state.writer_id.swap(client_id, Ordering::SeqCst);
 
         let ack = Frame::new(
             MsgKind::HelloAck,
@@ -727,7 +732,13 @@ fn handle_client(
         // Set up per-client outbound channel + drain thread
         let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE_BOUND);
         let stream_clone = stream.try_clone()?;
-        let _drain = spawn_client_drain(client_id, rx, stream_clone, state.clone());
+        let _drain = spawn_client_drain(
+            client_id,
+            previous_writer_id,
+            rx,
+            stream_clone,
+            state.clone(),
+        );
         {
             let mut out = state.output.lock().unwrap();
             out.clients.insert(client_id, ClientSender { tx, role });
@@ -770,7 +781,7 @@ fn handle_client(
     } else {
         // Not the first Writer, or Watcher/Monitor — PTY already running
         if role == Role::Writer {
-            state.writer_id.store(client_id, Ordering::SeqCst);
+            previous_writer_id = state.writer_id.swap(client_id, Ordering::SeqCst);
             *state.cols.write().unwrap() = client_cols;
             *state.rows.write().unwrap() = client_rows;
 
@@ -802,7 +813,13 @@ fn handle_client(
         // Set up per-client outbound channel + drain thread
         let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE_BOUND);
         let stream_clone = stream.try_clone()?;
-        let _drain = spawn_client_drain(client_id, rx, stream_clone, state.clone());
+        let _drain = spawn_client_drain(
+            client_id,
+            previous_writer_id,
+            rx,
+            stream_clone,
+            state.clone(),
+        );
 
         // Snapshot + register atomically with PTY processing, in screen → output
         // lock order, so live bytes cannot be duplicated or missed after replay.
@@ -819,6 +836,12 @@ fn handle_client(
                 // Preserve primary-screen scrollback for every role.
                 out.ring.recent()
             };
+            // Restore authoritative input modes after ring replay, whose oldest mode
+            // sequences may have rolled out of the history.
+            let mut replay_data = replay_data;
+            if role == Role::Writer {
+                replay_data.extend(screen.screen().input_mode_formatted());
+            }
             for encoded in replay_frames(&replay_data) {
                 let _ = tx.try_send(encoded);
             }
@@ -1033,9 +1056,12 @@ fn handle_client(
         out.clients.remove(&client_id);
         // Dropping the sender closes the channel, drain thread will exit
     }
-    let _ = state
-        .writer_id
-        .compare_exchange(client_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = state.writer_id.compare_exchange(
+        client_id,
+        previous_writer_id,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
 
     Ok(())
 }

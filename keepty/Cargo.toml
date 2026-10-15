@@ -12,6 +12,7 @@ name = "keepty"
 path = "src/main.rs"
 
 [dependencies]
+keepty-screen = { version = "0.1.1", path = "../keepty-screen" }
 keepty-protocol = { workspace = true }
 portable-pty = { workspace = true }
 nix = { workspace = true, features = ["signal", "process", "term"] }
