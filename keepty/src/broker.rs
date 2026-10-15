@@ -39,6 +39,20 @@ fn log(msg: &str) {
     eprintln!("[keepty] {}", msg);
 }
 
+// Accept failures must not release the session socket before shutdown.
+fn accept_error_backoff(running: bool, kind: std::io::ErrorKind) -> Option<std::time::Duration> {
+    if !running {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(
+        if kind == std::io::ErrorKind::WouldBlock {
+            50
+        } else {
+            100
+        },
+    ))
+}
+
 /// Ring buffer for output history (allows replay on reconnect)
 struct RingBuffer {
     buf: Vec<u8>,
@@ -595,6 +609,7 @@ pub fn run() -> Result<()> {
 
     let accept_sock_path = sock_path.clone();
     let accept_thread = thread::spawn(move || {
+        let mut last_accept_error_log: Option<std::time::Instant> = None;
         loop {
             if !state_accept.running.load(Ordering::SeqCst) {
                 break;
@@ -653,12 +668,22 @@ pub fn run() -> Result<()> {
                         }
                     });
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(std::time::Duration::from_millis(50));
-                }
                 Err(e) => {
-                    log(&format!("Accept error: {}", e));
-                    break;
+                    let Some(backoff) =
+                        accept_error_backoff(state_accept.running.load(Ordering::SeqCst), e.kind())
+                    else {
+                        break;
+                    };
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        let now = std::time::Instant::now();
+                        if last_accept_error_log.is_none_or(|last| {
+                            now.duration_since(last) >= std::time::Duration::from_secs(1)
+                        }) {
+                            log(&format!("Accept error: {}", e));
+                            last_accept_error_log = Some(now);
+                        }
+                    }
+                    thread::sleep(backoff);
                 }
             }
         }
@@ -1248,6 +1273,37 @@ fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::RingBuffer;
+
+    #[test]
+    fn accept_errors_retry_until_shutdown() {
+        use std::io::ErrorKind;
+        use std::time::Duration;
+
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ECONNABORTED,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EINTR,
+            libc::EBADF,
+        ] {
+            let kind = std::io::Error::from_raw_os_error(errno).kind();
+            assert_eq!(
+                super::accept_error_backoff(true, kind),
+                Some(Duration::from_millis(100))
+            );
+            assert_eq!(super::accept_error_backoff(false, kind), None);
+        }
+        assert_eq!(
+            super::accept_error_backoff(true, ErrorKind::WouldBlock),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            super::accept_error_backoff(false, ErrorKind::WouldBlock),
+            None
+        );
+    }
 
     fn queue_at(bytes: usize) -> super::ClientQueue {
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
