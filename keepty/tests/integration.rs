@@ -638,6 +638,9 @@ where
     use std::os::unix::net::UnixListener;
     let id = unique_id(label);
     let path = socket_path(&id);
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
     let listener = UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let replay = replay.to_vec();
