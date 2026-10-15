@@ -546,6 +546,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 }
             }
             let mut raw = RawText::default();
+            let mut painted = new_text.then(|| PaintedCells::new(reader.screen()));
             let text_matches = |reader: &ScreenReader| {
                 !new_text
                     && text
@@ -585,6 +586,11 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 match reader.poll_with_raw(interval, |reader, output| {
                     if new_text {
                         matched |= raw.feed(output, text.as_ref().unwrap().as_bytes());
+                        matched |= painted.as_mut().unwrap().feed(
+                            output,
+                            reader.screen(),
+                            text.as_ref().unwrap(),
+                        );
                     }
                     matched |= text_matches(reader);
                     let current = normalize(reader.contents());
@@ -613,6 +619,105 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
         _ => unreachable!(),
     }
     Ok(0)
+}
+
+// The shadow starts with no pre-arm text, but retains the terminal's state.
+// Clone through screen_mut rather than serializing away terminal modes.
+struct PaintedCells {
+    shadow: vt100_screen::Parser,
+    escape: bool,
+}
+
+impl PaintedCells {
+    const SENTINEL: char = '\u{e000}';
+
+    fn new(screen: &vt100_screen::Screen) -> Self {
+        let (rows, cols) = screen.size();
+        let mut shadow = vt100_screen::Parser::new(rows, cols, 0);
+        *shadow.screen_mut() = screen.clone();
+        // Save/restore also preserves origin mode and the pending-wrap cursor.
+        shadow.process(b"\x1b7\x1b[?6l");
+        for row in 0..rows {
+            let fill = format!(
+                "\x1b[{};1H{}",
+                row + 1,
+                Self::SENTINEL.to_string().repeat(cols.into())
+            );
+            shadow.process(fill.as_bytes());
+        }
+        shadow.process(b"\x1b8");
+        Self {
+            shadow,
+            escape: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8], live: &vt100_screen::Screen, needle: &str) -> bool {
+        // Resizing cannot expose old text as newly painted.
+        if self.shadow.screen().size() != live.size() {
+            *self = Self::new(live);
+            return false;
+        }
+        // Filling uses DEC save/restore. Its saved-cursor slot is private in
+        // vt100, so conservatively re-arm after any subsequent DEC restore.
+        // Keep escape detection across Output frames as well.
+        let mut restored = false;
+        for &byte in bytes {
+            restored |= self.escape && byte == b'8';
+            self.escape = byte == 0x1b;
+        }
+        let switched = self.shadow.screen().alternate_screen() != live.alternate_screen();
+        self.shadow.process(bytes);
+        if restored || switched {
+            *self = Self::new(live);
+            return false;
+        }
+        let (rows, cols) = live.size();
+        for row in 0..rows {
+            let mut run = String::new();
+            let mut gap = 0;
+            for col in 0..cols {
+                let cell = self.shadow.screen().cell(row, col).unwrap();
+                let content = cell.contents();
+                if content.contains(Self::SENTINEL) {
+                    let live_cell = live.cell(row, col).unwrap();
+                    if !run.is_empty()
+                        && !live_cell.is_wide_continuation()
+                        && (live_cell.contents().is_empty() || live_cell.contents() == " ")
+                    {
+                        gap += 1;
+                    } else {
+                        run.clear();
+                        gap = 0;
+                    }
+                } else {
+                    // If a terminal transition diverged, prefer a missed match
+                    // to reporting text that is not on the live screen.
+                    let live_cell = live.cell(row, col).unwrap();
+                    if content != live_cell.contents()
+                        || cell.is_wide_continuation() != live_cell.is_wide_continuation()
+                    {
+                        run.clear();
+                        gap = 0;
+                        continue;
+                    }
+                    // Only internal blank gaps are eligible; a trailing gap is
+                    // never searched before another painted cell arrives.
+                    run.extend(std::iter::repeat_n(' ', gap));
+                    gap = 0;
+                    if content.is_empty() && !cell.is_wide_continuation() {
+                        run.push(' ');
+                    } else {
+                        run.push_str(content);
+                    }
+                    if run.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 // Stateful across Output frames, including escape sequences and UTF-8 bytes.
@@ -846,5 +951,107 @@ mod raw_text_tests {
         let mut raw = RawText::default();
         raw.feed(&vec![b'x'; 100_000], b"answer");
         assert!(raw.tail.len() <= 262);
+    }
+}
+
+#[cfg(test)]
+mod painted_cell_tests {
+    use super::PaintedCells;
+
+    fn check(initial: &[u8], chunks: &[&[u8]], needle: &str) -> bool {
+        let mut live = vt100_screen::Parser::new(4, 24, 0);
+        live.process(initial);
+        let mut painted = PaintedCells::new(live.screen());
+        let mut matched = false;
+        for bytes in chunks {
+            live.process(bytes);
+            matched |= painted.feed(bytes, live.screen(), needle);
+        }
+        matched
+    }
+
+    #[test]
+    fn moved_text_ignored() {
+        for movement in [
+            b"\x1b[1;1H\x1b[L".as_slice(),
+            b"\x1b[1;1H\x1b[M",
+            b"\x1b[4;1H\n",
+        ] {
+            assert!(!check(b"old\r\nold\r\nold", &[movement], "old"));
+        }
+    }
+
+    #[test]
+    fn cup_out_of_order() {
+        assert!(check(
+            b"",
+            &[b"\x1b[1;7Hworld", b"\x1b[1;1Hhello"],
+            "hello world"
+        ));
+        assert!(check(b"", &[b"hello\x1b[1Cworld"], "hello world"));
+    }
+
+    #[test]
+    fn overpaint() {
+        assert!(check(b"", &[b"hxllo", b"\x1b[1;2He"], "hello"));
+        assert!(!check(b"", &[b"hello\x1b[1;2Hx"], "hello"));
+    }
+
+    #[test]
+    fn nonblank_gap_blocks_joining() {
+        assert!(!check(
+            b"\x1b[1;6HX",
+            &[b"\x1b[1;1Hhello\x1b[1Cworld"],
+            "hello world"
+        ));
+        assert!(!check(b"", &[b"hello\x1b[1C"], "hello "));
+    }
+
+    #[test]
+    fn rows_not_joined() {
+        assert!(!check(b"", &[b"hello\r\nworld"], "helloworld"));
+        assert!(!check(b"", &[b"hello\r\nworld"], "hello world"));
+    }
+
+    #[test]
+    fn spinner() {
+        assert!(!check(b"ready", &["\x1b[2;1H⠋\r⠙\r⠹".as_bytes()], "ready"));
+        assert!(check(b"", &["⠋\r⠙\r⠹".as_bytes(), b"\rready"], "ready"));
+    }
+
+    #[test]
+    fn unicode_and_split_output() {
+        let bytes = "\x1b[1;4H界\x1b[1;1Hé".as_bytes();
+        let chunks: Vec<&[u8]> = bytes.chunks(1).collect();
+        assert!(check(b"", &chunks, "é  界"));
+    }
+
+    #[test]
+    fn scroll_region_origin_and_pending_wrap() {
+        assert!(check(
+            b"\x1b[2;3r\x1b[?6h",
+            &[b"\x1b[1;7Hworld", b"\x1b[1;1Hhello"],
+            "hello world"
+        ));
+        assert!(!check(
+            b"abcdefghijklmnopqrstuvwx",
+            &[b"hello", b"\x1b[2;7Hworld"],
+            "xhello"
+        ));
+        assert!(check(
+            b"abcdefghijklmnopqrstuvwx",
+            &[b"hello", b"\x1b[2;7Hworld"],
+            "hello world"
+        ));
+    }
+
+    #[test]
+    fn saved_cursor_and_alternate_screen_are_conservative() {
+        assert!(!check(b"old\x1b7\x1b[3;1H", &[b"\x1b8"], "old"));
+        assert!(!check(
+            b"old\x1b[?47hother\x1b[?47l",
+            &[b"\x1b[?47h"],
+            "other"
+        ));
     }
 }

@@ -98,6 +98,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vt100 0.15.2",
+ "vt100 0.16.2",
 ]
 
 [[package]]

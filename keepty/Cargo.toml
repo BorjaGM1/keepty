@@ -21,3 +21,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 vt100 = { workspace = true }
+# Match keepty-screen's version for Screen::clone and Parser::screen_mut;
+# leave the broker's vt100 dependency unchanged.
+vt100-screen = { package = "vt100", version = "0.16.2" }

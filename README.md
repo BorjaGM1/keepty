@@ -88,11 +88,16 @@ unchanged screen, 1 on timeout, or 3 when the session exits. Quiet detection
 ignores changes between braille spinner characters (U+2800–U+28FF).
 
 Use `keepty wait agent --text "Hi" --new --timeout 30` to match
-new raw output received after wait synchronizes its initial replay, rather than
-watching the screen. Existing text is ignored; redraws and reprints count, even
-if the same text stays on screen or previously scrolled off. An in-place edit
-that does not emit the full needle does not match. ANSI styling is ignored.
+either new raw output or newly painted contiguous cells on the same screen row,
+after wait synchronizes its initial replay. ANSI styling is ignored. Existing
+text is ignored; redraws, reprints, and echo of your own typed text still match.
+Text merely moved by scrolling does not match the painted-cell path. Cursor
+jumps and out-of-order painting can assemble a match; blank gaps between painted
+cells may bridge spaces in the needle, but non-blank gaps and separate rows do
+not join. The raw-output path still matches text even if it scrolls off screen.
 Choose a needle that is not in what you just typed if the app echoes input.
+The painted-cell path conservatively resets on resize, alternate-screen changes,
+and saved-cursor restores, so it can miss text spanning those operations.
 Without `--new`, existing text still matches immediately. This CLI-only flag
 requires `--text`; the timeout includes initial synchronization.
 
