@@ -25,7 +25,7 @@ fn print_usage() {
         "  keepty send <id> <text> [--submit] [--submit-delay MS (default 1000, minimum 50)]"
     );
     eprintln!("  keepty keys <id> <name>...");
-    eprintln!("  keepty wait <id> (--text STR | --quiet MS) [--timeout SECS (default 30)]");
+    eprintln!("  keepty wait <id> (--text STR [--new] | --quiet MS) [--timeout SECS (default 30)]");
     eprintln!("  keepty list");
     eprintln!("  keepty stop <session-id>");
     eprintln!();
@@ -383,6 +383,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
     let mut text = None;
     let mut quiet = None;
     let mut history = None;
+    let mut new_text = false;
     let mut keys = Vec::new();
     if command == "keys" {
         if args.len() < 2 {
@@ -411,6 +412,8 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                     history = Some(value.parse::<usize>().map_err(|_| invalid())?);
                     i += 1;
                 }
+            } else if option == "--new" && command == "wait" {
+                new_text = true;
             } else {
                 i += 1;
                 let value = args.get(i).ok_or_else(invalid)?;
@@ -435,7 +438,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
             i += 1;
         }
     }
-    if command == "wait" && text.is_none() && quiet.is_none() {
+    if command == "wait" && ((text.is_none() && quiet.is_none()) || (new_text && text.is_none())) {
         return Err(invalid());
     }
     if delay < 50
@@ -444,6 +447,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
     {
         return Err(invalid());
     }
+    let started = Instant::now();
     let role = if command == "send" || command == "keys" {
         Role::Writer
     } else {
@@ -453,14 +457,23 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
         let monitor = ScreenReader::connect(&socket_path(id), Role::Monitor)?;
         (rows, cols) = monitor.size();
     }
-    let mut reader = ScreenReader::connect_with_size_and_history(
+    let connection_timeout = if command == "wait" {
+        Duration::from_secs(timeout).saturating_sub(started.elapsed())
+    } else {
+        Duration::from_secs(5)
+    };
+    let mut reader = match ScreenReader::connect_with_size_history_timeout(
         &socket_path(id),
         role,
         cols,
         rows,
         history.unwrap_or(0),
-    )?;
-    let started = Instant::now();
+        connection_timeout,
+    ) {
+        Ok(reader) => reader,
+        Err(e) if command == "wait" && e.kind() == ErrorKind::TimedOut => return Ok(1),
+        Err(e) => return Err(e),
+    };
     match command {
         "screen" => {
             // Synchronize history replay; preserve the default screen polling behavior.
@@ -517,6 +530,28 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
             reader.sync(Duration::from_secs(5))?;
         }
         "wait" => {
+            if new_text {
+                let remaining = Duration::from_secs(timeout).saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Ok(1);
+                }
+                match reader.sync(remaining) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::TimedOut => return Ok(1),
+                    Err(e) if e.kind() == ErrorKind::ConnectionAborted => return Ok(3),
+                    Err(e) => return Err(e),
+                }
+                if std::env::var_os("KEEPTY_DEBUG_ARMED").is_some() {
+                    eprintln!("armed");
+                }
+            }
+            let mut raw = RawText::default();
+            let text_matches = |reader: &ScreenReader| {
+                !new_text
+                    && text
+                        .as_ref()
+                        .is_some_and(|needle| reader.contents().contains(needle))
+            };
             let normalize = |s: String| {
                 s.chars()
                     .map(|c| {
@@ -532,7 +567,7 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
             let mut changed = Instant::now();
             let mut matched = false;
             loop {
-                if matched || text.as_ref().is_some_and(|t| reader.contents().contains(t)) {
+                if matched || text_matches(&reader) {
                     return Ok(0);
                 }
                 if quiet.is_some_and(|ms| changed.elapsed() >= Duration::from_millis(ms)) {
@@ -547,8 +582,11 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                     interval =
                         interval.min(Duration::from_millis(ms).saturating_sub(changed.elapsed()));
                 }
-                match reader.poll_with(interval, |reader| {
-                    matched |= text.as_ref().is_some_and(|t| reader.contents().contains(t));
+                match reader.poll_with_raw(interval, |reader, output| {
+                    if new_text {
+                        matched |= raw.feed(output, text.as_ref().unwrap().as_bytes());
+                    }
+                    matched |= text_matches(reader);
                     let current = normalize(reader.contents());
                     if current != previous {
                         previous = current;
@@ -557,15 +595,11 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 }) {
                     Ok(_) => {}
                     Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
-                        return Ok(
-                            if matched
-                                || text.as_ref().is_some_and(|t| reader.contents().contains(t))
-                            {
-                                0
-                            } else {
-                                3
-                            },
-                        );
+                        return Ok(if matched || text_matches(&reader) {
+                            0
+                        } else {
+                            3
+                        });
                     }
                     Err(e) => return Err(e),
                 }
@@ -579,6 +613,77 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
         _ => unreachable!(),
     }
     Ok(0)
+}
+
+// Stateful across Output frames, including escape sequences and UTF-8 bytes.
+#[derive(Default)]
+struct RawText {
+    state: u8,
+    tail: Vec<u8>,
+}
+
+impl RawText {
+    fn feed(&mut self, bytes: &[u8], needle: &[u8]) -> bool {
+        let mut matched = false;
+        for &b in bytes {
+            match self.state {
+                0 => match b {
+                    0x1b => self.state = 1,
+                    b'\r' | b'\n' | 0x08 | 0x09 => self.tail.push(b'\n'),
+                    0..=0x1f | 0x7f => {}
+                    _ => self.tail.push(b),
+                },
+                1 => match b {
+                    b'[' => self.state = 2,
+                    b']' => self.state = 3,
+                    b'P' | b'X' | b'^' | b'_' => self.state = 4,
+                    0x20..=0x2f => self.state = 6, // charset / intermediate ESC
+                    _ => {
+                        // Save/restore cursor, index, next line, reverse index, reset.
+                        if matches!(b, b'7' | b'8' | b'D' | b'E' | b'M' | b'c') {
+                            self.tail.push(b'\n');
+                        }
+                        self.state = 0;
+                    }
+                },
+                2 => {
+                    if (0x40..=0x7e).contains(&b) {
+                        // SGR and mode switches do not interrupt adjacent text.
+                        if !matches!(b, b'm' | b'h' | b'l') {
+                            self.tail.push(b'\n');
+                        }
+                        self.state = 0;
+                    }
+                }
+                3 | 4 => {
+                    if b == 0x1b {
+                        self.state += 4;
+                    } else if b == 7 && self.state == 3 {
+                        self.state = 0;
+                    }
+                }
+                6 => {
+                    if (0x30..=0x7e).contains(&b) {
+                        self.state = 0;
+                    }
+                }
+                7 | 8 => {
+                    if b == b'\\' {
+                        self.state = 0;
+                    } else if b != 0x1b {
+                        self.state -= 4;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            matched |= self.tail.ends_with(needle);
+            let limit = needle.len().saturating_add(256);
+            if self.tail.len() > limit {
+                self.tail.drain(..self.tail.len() - limit);
+            }
+        }
+        matched
+    }
 }
 
 fn named_key(name: &str, application: bool) -> Option<Vec<u8>> {
@@ -710,4 +815,36 @@ fn main() {
     };
 
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod raw_text_tests {
+    use super::RawText;
+
+    #[test]
+    fn escapes_and_frames() {
+        for decoration in [
+            b"\x1b[1m".as_slice(),
+            b"\x1b]0;title\x07",
+            b"\x1bPignored\x1b\\",
+            b"\x1b(B",
+            b"\x1b=",
+            b"\x00",
+        ] {
+            let bytes = [b"ans".as_slice(), decoration, b"wer"].concat();
+            let mut raw = RawText::default();
+            let mut matched = false;
+            for b in bytes {
+                matched |= raw.feed(&[b], b"answer");
+            }
+            assert!(matched, "{decoration:?}");
+        }
+        for boundary in [b"\r".as_slice(), b"\n", b"\x1b[1A", b"\x1bD"] {
+            let mut raw = RawText::default();
+            assert!(!raw.feed(&[b"ans".as_slice(), boundary, b"wer"].concat(), b"answer"));
+        }
+        let mut raw = RawText::default();
+        raw.feed(&vec![b'x'; 100_000], b"answer");
+        assert!(raw.tail.len() <= 262);
+    }
 }

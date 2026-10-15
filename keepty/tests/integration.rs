@@ -910,6 +910,113 @@ fn cli_wait_text_quiet_timeout_and_exit() {
 }
 
 #[test]
+fn cli_wait_new_ignores_existing_text_and_default_still_matches() {
+    let id = unique_id("cli-wait-new-baseline");
+    let child = start_broker(&id, "printf 'prompt: answer'; sleep 30");
+    let mut writer = connect(&id, Role::Writer);
+    assert!(
+        read_until_output_contains(&mut writer, "answer", Duration::from_secs(5))
+            .contains("answer")
+    );
+    assert!(
+        agent_cli(&["wait", &id, "--text", "answer", "--timeout", "1"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        agent_cli(&["wait", &id, "--new", "--text", "answer", "--timeout", "1"])
+            .status
+            .code(),
+        Some(1)
+    );
+    for args in [
+        vec!["wait", &id, "--new"],
+        vec!["wait", &id, "--quiet", "100", "--new"],
+    ] {
+        assert_eq!(agent_cli(&args).status.code(), Some(2));
+    }
+    cleanup(child, &id);
+}
+
+#[test]
+fn cli_wait_new_timeout_bounds_handshake_and_sync() {
+    use std::os::unix::net::UnixListener;
+    for acknowledge in [false, true] {
+        let id = unique_id("cli-wait-new-deadline");
+        let path = socket_path(&id);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            Frame::read_from(&mut peer).unwrap();
+            if acknowledge {
+                Frame::new(MsgKind::HelloAck, encode_hello_ack(123, 80, 24))
+                    .write_to(&mut peer)
+                    .unwrap();
+            }
+            // Keep the connection open without acknowledging replay sync.
+            std::thread::sleep(Duration::from_millis(2200));
+        });
+        let started = std::time::Instant::now();
+        let result = agent_cli(&["wait", &id, "--text", "answer", "--new", "--timeout", "1"]);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn cli_wait_new_raw_output() {
+    use std::io::{BufRead, BufReader};
+    for (output, expected) in [
+        (r#"os.write(1,b"!")"#, 1),
+        (r#"os.write(1,b"\x1b[2J\x1b[Hprompt: answer")"#, 0),
+        (r#"os.write(1,b"\r\n"*30+b"answer")"#, 0),
+        (r#"os.write(1,b"ans\x1b[1mwer")"#, 0),
+        (
+            r#"os.write(1,b"ans"); time.sleep(.15); os.write(1,b"wer")"#,
+            0,
+        ),
+        (r#"os.write(1,b"ans\rwer")"#, 1),
+        (r#"os.write(1,b"ans\x1b[Hwer")"#, 1),
+    ] {
+        let id = unique_id("cli-wait-new-raw");
+        let command = format!(
+            r#"stty raw -echo; python3 -u -c 'import os,time
+os.write(1,b"prompt: answer")
+os.read(0,1)
+{output}
+time.sleep(30)'"#
+        );
+        let child = start_broker(&id, &command);
+        let mut writer = connect(&id, Role::Writer);
+        assert!(
+            read_until_output_contains(&mut writer, "answer", Duration::from_secs(5))
+                .contains("answer")
+        );
+        let started = std::time::Instant::now();
+        let mut wait = Command::new(keepty_bin())
+            .args(["wait", &id, "--text", "answer", "--new", "--timeout", "1"])
+            .env("KEEPTY_DEBUG_ARMED", "1")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut marker = String::new();
+        BufReader::new(wait.stderr.take().unwrap())
+            .read_line(&mut marker)
+            .unwrap();
+        assert_eq!(marker.trim(), "armed");
+        assert!(wait.try_wait().unwrap().is_none());
+        Frame::new(MsgKind::Input, b"!".to_vec())
+            .write_to(&mut writer)
+            .unwrap();
+        assert_eq!(wait.wait().unwrap().code(), Some(expected), "{output}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        cleanup(child, &id);
+    }
+}
+
+#[test]
 fn cli_wait_quiet_ignores_continuous_braille_spinner() {
     let id = unique_id("cli-spinner");
     let child = start_broker(

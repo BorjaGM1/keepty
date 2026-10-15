@@ -87,6 +87,15 @@ the final Enter before exiting. `keys` accepts `enter`, `tab`, `esc`, `backspace
 unchanged screen, 1 on timeout, or 3 when the session exits. Quiet detection
 ignores changes between braille spinner characters (U+2800–U+28FF).
 
+Use `keepty wait agent --text "Hi" --new --timeout 30` to match
+new raw output received after wait synchronizes its initial replay, rather than
+watching the screen. Existing text is ignored; redraws and reprints count, even
+if the same text stays on screen or previously scrolled off. An in-place edit
+that does not emit the full needle does not match. ANSI styling is ignored.
+Choose a needle that is not in what you just typed if the app echoes input.
+Without `--new`, existing text still matches immediately. This CLI-only flag
+requires `--text`; the timeout includes initial synchronization.
+
 
 Install screen support into the same environment with
 `~/.venvs/keepty/bin/pip install 'keepty[screen]'` and run the example with

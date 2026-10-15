@@ -67,6 +67,32 @@ impl ScreenReader {
         rows: u16,
         history: usize,
     ) -> io::Result<Self> {
+        Self::connect_with_size_history_timeout(
+            socket_path,
+            role,
+            cols,
+            rows,
+            history,
+            Duration::from_secs(5),
+        )
+    }
+
+    /// Connect with a deadline covering the handshake and initial polling.
+    pub fn connect_with_size_history_timeout(
+        socket_path: &str,
+        role: Role,
+        cols: u16,
+        rows: u16,
+        history: usize,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        let started = std::time::Instant::now();
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection timed out",
+            ));
+        }
         let mut stream = UnixStream::connect(socket_path)?;
         stream.set_nonblocking(false)?;
 
@@ -76,8 +102,12 @@ impl ScreenReader {
 
         // Buffer even the handshake: a timeout must never discard partial bytes.
         let mut read_buffer = Vec::new();
-        let ack = Self::read_frame(&mut stream, &mut read_buffer, Duration::from_secs(5))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HelloAck timed out"))?;
+        let ack = Self::read_frame(
+            &mut stream,
+            &mut read_buffer,
+            timeout.saturating_sub(started.elapsed()),
+        )?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HelloAck timed out"))?;
 
         if ack.kind != MsgKind::HelloAck {
             return Err(io::Error::new(
@@ -104,7 +134,14 @@ impl ScreenReader {
         };
 
         // Preserve replay, including a leading Exit, without a two-second idle wait.
-        match reader.poll(Duration::from_millis(20)) {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection timed out",
+            ));
+        }
+        match reader.poll(remaining.min(Duration::from_millis(20))) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
             Err(e) => return Err(e),
@@ -145,6 +182,17 @@ impl ScreenReader {
         timeout: Duration,
         mut observe: F,
     ) -> io::Result<usize> {
+        self.poll_with_raw(timeout, |reader, _| observe(reader))
+    }
+
+    /// Like `poll_with`, also exposing raw Output payloads after parsing.
+    /// ResizeAck observations receive an empty byte slice. Replay is included;
+    /// call `sync` first to observe only subsequently received output.
+    pub fn poll_with_raw<F: FnMut(&Self, &[u8])>(
+        &mut self,
+        timeout: Duration,
+        mut observe: F,
+    ) -> io::Result<usize> {
         if timeout.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -177,12 +225,12 @@ impl ScreenReader {
                 MsgKind::Output => {
                     self.parser.process(&frame.payload);
                     count += 1;
-                    observe(self);
+                    observe(self, &frame.payload);
                 }
                 MsgKind::ResizeAck => {
                     self.apply_resize_ack(&frame.payload)?;
                     count += 1;
-                    observe(self);
+                    observe(self, &[]);
                 }
                 MsgKind::Ping => {
                     Frame::new(MsgKind::Pong, vec![]).write_to(&mut self.stream)?;
@@ -611,6 +659,24 @@ mod tests {
         assert_eq!(cols, 120);
         assert_eq!(rows, 40);
     }
+    #[test]
+    fn raw_observer_preserves_output_payloads() {
+        let (mut reader, mut peer) = reader_with_peer(Role::Monitor, 80, 24);
+        let payloads = [b"ans\x1b[1m".to_vec(), b"wer\r".to_vec()];
+        for payload in &payloads {
+            Frame::new(MsgKind::Output, payload.clone())
+                .write_to(&mut peer)
+                .unwrap();
+        }
+        let mut observed = Vec::new();
+        reader
+            .poll_with_raw(Duration::from_millis(5), |_, bytes| {
+                observed.push(bytes.to_vec())
+            })
+            .unwrap();
+        assert_eq!(observed, payloads);
+    }
+
     #[test]
     fn partial_frames_survive_timeouts_and_observers_see_every_change() {
         use std::io::Write;
