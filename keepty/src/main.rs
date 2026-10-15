@@ -264,8 +264,19 @@ fn cmd_list() -> i32 {
         if name.starts_with(prefix) && name.ends_with(suffix) {
             let id = &name[prefix.len()..name.len() - suffix.len()];
             let path = entry.path();
-            let alive = std::os::unix::net::UnixStream::connect(&path).is_ok();
-            sessions.push((id.to_string(), alive));
+            // Only a refused connection proves the listener is gone. Preserve
+            // entries on permission errors or transient resource exhaustion.
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => sessions.push((id.to_string(), true)),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    use std::os::unix::fs::FileTypeExt;
+                    if entry.file_type().is_ok_and(|t| t.is_socket()) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => sessions.push((id.to_string(), false)),
+            }
         }
     }
 

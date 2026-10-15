@@ -71,3 +71,26 @@ Terminal resizes → SIGWINCH to attach process
 - **TERM**: Child process gets `TERM=xterm-256color` hardcoded. This means terminal-specific features (Kitty image protocol, Sixel) require the child to probe capabilities at runtime, not rely on `$TERM`
 - **Detach keys**: Writer: `,,,d` (three commas + d). Watcher: Ctrl+C. Printable chars bypass kitty keyboard protocol / CSI-u encoding
 - **Watcher replay**: Primary-screen ring history or alternate-screen snapshot; no connect resize nudge. Python only waits for a nudge for Writers. Watcher detach leaves the alternate screen and disables mouse tracking and application cursor/keypad modes, then shows the cursor.
+
+## Session cleanup
+
+The PTY backend (`portable-pty`) calls `setsid()` before executing the command,
+so the child starts a new session and process group with PGID equal to its PID.
+On `keepty stop`, SIGTERM/SIGINT to the broker, PTY closure, or natural child
+exit, the broker sends SIGHUP, SIGTERM, then SIGKILL to that original group,
+with 250 ms between stages. Cleanup runs once before the Exit notification and
+socket removal. Disconnecting a client still leaves the session running.
+
+Processes that call `setsid()` themselves escape the original process group;
+job-control shells can also create separate groups. On Linux the broker enables
+`PR_SET_CHILD_SUBREAPER`, so orphaned descendants (including double-forked
+daemons) reparent to it. At each shutdown stage it also walks `/proc` task
+children recursively and signals descendants individually, then reaps adopted
+children. This is best-effort process-tree cleanup, not cgroup containment:
+concurrent forks, inaccessible `/proc`, or an uncatchable broker SIGKILL/crash
+can defeat cleanup. Other platforms receive process-group cleanup only, so
+self-detached daemons can survive there. No user-wide process matching is used.
+
+`keepty list` removes socket files whose connection attempt returns
+`ConnectionRefused`, omitting those dead sessions from the listing. Other
+connection errors preserve the entry; a successful connection preserves it.

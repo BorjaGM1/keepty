@@ -157,23 +157,52 @@ impl Drop for ConnectionSlot {
     }
 }
 
-/// Kill the child process group: SIGTERM first, then SIGKILL after grace period.
-fn terminate_child_group(pty_pid: u32) {
-    if pty_pid == 0 {
-        return;
+/// Linux subreaper adoption keeps double-forked/setsid descendants under this
+/// broker. Traverse every task because the PTY child is spawned on a worker.
+#[cfg(target_os = "linux")]
+fn descendants(pid: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        for task in tasks.flatten() {
+            if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                for child in children.split_whitespace().filter_map(|s| s.parse().ok()) {
+                    result.push(child);
+                    result.extend(descendants(child));
+                }
+            }
+        }
     }
-    let pid = Pid::from_raw(pty_pid as i32);
+    result
+}
 
-    let pgid = match nix::unistd::getpgid(Some(pid)) {
-        Ok(pg) => pg,
-        Err(_) => pid,
-    };
-
-    log(&format!("Terminating child process group (pgid={})", pgid));
-
-    let _ = signal::killpg(pgid, Signal::SIGTERM);
-    thread::sleep(std::time::Duration::from_secs(2));
-    let _ = signal::killpg(pgid, Signal::SIGKILL);
+/// The PTY backend calls setsid(), so the original child's PID is its PGID.
+/// Keep using that ID after the leader exits; never resolve a different group.
+fn terminate_child_group(pty_pid: u32) {
+    for sig in [Signal::SIGHUP, Signal::SIGTERM, Signal::SIGKILL] {
+        if pty_pid != 0 {
+            let _ = signal::killpg(Pid::from_raw(pty_pid as i32), sig);
+        }
+        #[cfg(target_os = "linux")]
+        for pid in descendants(std::process::id()).into_iter().rev() {
+            let _ = signal::kill(Pid::from_raw(pid as i32), sig);
+        }
+        // Re-scan at each stage to include newly adopted or forked descendants.
+        thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // Cleanup is the only reaper now; the portable-pty child is no longer polled.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            let status = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if status < 0 {
+                break;
+            }
+            if status == 0 {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 /// Global write-end of signal self-pipe.
@@ -303,6 +332,10 @@ pub fn run() -> Result<()> {
         .init();
 
     let (session_id, argv, working_dir, cols, rows) = parse_args()?;
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to enable child subreaper");
+    }
     let sock_path = socket_path(&session_id);
 
     // Validate socket path length (macOS limit: 104 bytes, Linux: 108)
@@ -520,8 +553,6 @@ pub fn run() -> Result<()> {
 
         if !state.running.load(Ordering::SeqCst) {
             log("Shutdown flag set, terminating child");
-            let pid = state.pty_pid.load(Ordering::SeqCst);
-            terminate_child_group(pid);
             exit_code = 143;
             break;
         }
@@ -543,8 +574,6 @@ pub fn run() -> Result<()> {
                 _ => {
                     log("Received SIGTERM/SIGINT");
                     state.running.store(false, Ordering::SeqCst);
-                    let pid = state.pty_pid.load(Ordering::SeqCst);
-                    terminate_child_group(pid);
                     exit_code = 143;
                     break;
                 }
@@ -554,6 +583,9 @@ pub fn run() -> Result<()> {
         thread::sleep(std::time::Duration::from_millis(100));
     }
     state.running.store(false, Ordering::SeqCst);
+    // Serialize with deferred spawn so shutdown cannot miss a late child.
+    let _child_guard = child_holder.lock().unwrap();
+    terminate_child_group(state.pty_pid.load(Ordering::SeqCst));
 
     // Broadcast Exit to all clients via channels, then drop senders.
     // Dropping senders closes channels, causing drain threads to flush and exit.
@@ -721,6 +753,10 @@ fn handle_client(
             cmd.cwd(dir);
         }
 
+        let mut holder = child_holder.lock().unwrap();
+        if !state.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -730,10 +766,7 @@ fn handle_client(
         log(&format!("Child spawned with PID {}", pid));
         state.pty_pid.store(pid, Ordering::SeqCst);
 
-        {
-            let mut holder = child_holder.lock().unwrap();
-            *holder = Some(child);
-        }
+        *holder = Some(child);
     } else {
         // Not the first Writer, or Watcher/Monitor — PTY already running
         if role == Role::Writer {
@@ -975,9 +1008,9 @@ fn handle_client(
                 if writer == client_id || role == Role::Monitor || writer == 0 {
                     log(&format!("Shutdown requested by client {}", client_id));
                     state.running.store(false, Ordering::SeqCst);
-                    let pid = state.pty_pid.load(Ordering::SeqCst);
-                    terminate_child_group(pid);
-                    break;
+                    // Keep this sender registered for the main loop's Exit
+                    // broadcast; dropping the handler's stream is harmless.
+                    return Ok(());
                 }
                 // Silently ignore — forward compat, don't disconnect
             }

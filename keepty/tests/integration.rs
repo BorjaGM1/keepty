@@ -501,3 +501,104 @@ fn readonly_clients_replay_current_alternate_screen() {
     }
     cleanup(child, &id);
 }
+
+#[cfg(target_os = "linux")]
+fn assert_descendant_cleanup(detached: bool, natural_exit: bool) {
+    let id = unique_id("descendants");
+    let pidfile = std::env::temp_dir().join(format!("{id}.pid"));
+    // Ignore the graceful signals to exercise SIGKILL escalation too. The
+    // detached shell writes its own PID (setsid may fork internally).
+    let spawn = if detached { "setsid sh" } else { "sh" };
+    let command = format!(
+        "{spawn} -c 'trap \"\" HUP TERM; echo $$ > {}; exec sleep 1000' & while [ ! -s {} ]; do sleep 0.01; done; echo READY; {}",
+        pidfile.display(), pidfile.display(),
+        if natural_exit { "exit 7" } else { "wait" }
+    );
+    let mut broker = start_broker(&id, &command);
+    let mut writer = connect(&id, Role::Writer);
+    let output = read_until_output_contains(&mut writer, "READY", Duration::from_secs(5));
+    assert!(output.contains("READY"), "{output}");
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    if !natural_exit {
+        assert!(Command::new(keepty_bin())
+            .args(["stop", &id])
+            .status()
+            .unwrap()
+            .success());
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = broker.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(if natural_exit { 7 } else { 143 }));
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            cleanup(broker, &id);
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            panic!("Broker did not finish cleanup");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "Descendant {pid} survived or was not reaped"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert!(!std::path::Path::new(&socket_path(&id)).exists());
+    std::fs::remove_file(pidfile).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_kills_background_grandchild() {
+    assert_descendant_cleanup(false, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_kills_setsid_descendant() {
+    assert_descendant_cleanup(true, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn child_exit_kills_setsid_descendant() {
+    assert_descendant_cleanup(true, true);
+}
+
+#[test]
+fn list_prunes_refused_sockets_and_preserves_live_sessions() {
+    use std::os::unix::net::UnixListener;
+    let id = unique_id("list");
+    let root = std::env::temp_dir().join(&id);
+    let dir = root.join("keepty");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stale = dir.join("keepty-stale.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    let live = dir.join("keepty-live.sock");
+    let _listener = UnixListener::bind(&live).unwrap();
+    let output = Command::new(keepty_bin())
+        .arg("list")
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("TMPDIR", &root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("live  (running)"), "{stdout}");
+    assert!(!stdout.contains("stale"), "{stdout}");
+    assert!(!stale.exists());
+    assert!(live.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
