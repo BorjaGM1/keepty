@@ -467,10 +467,12 @@ pub fn run(session_id: &str, watch_mode: bool) -> io::Result<()> {
 
     restore_terminal(&original_termios);
 
-    // Switch back to main screen buffer
+    // Leave the alternate screen and reset input modes received from the child.
     {
         let mut stdout = io::stdout();
-        let _ = stdout.write_all(b"\x1b[?1049l");
+        let _ = stdout.write_all(
+            b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1l\x1b>\x1b[?25h",
+        );
         let _ = stdout.flush();
     }
 

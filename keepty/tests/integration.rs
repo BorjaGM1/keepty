@@ -287,43 +287,44 @@ fn shutdown_terminates_session() {
 #[test]
 fn ring_buffer_replays_on_reconnect() {
     let id = unique_id("replay");
-    let child = start_broker(&id, "echo replay-data-here; sleep 30");
+    let child = start_broker(&id, "echo replay-data-here; i=0; while [ $i -lt 60 ]; do echo scroll-line-$i; i=$((i + 1)); done; echo replay-ready; sleep 30");
 
     // First client: connect, receive output, disconnect
     {
         let mut stream1 = connect(&id, Role::Writer);
         let output =
-            read_until_output_contains(&mut stream1, "replay-data-here", Duration::from_secs(5));
+            read_until_output_contains(&mut stream1, "replay-ready", Duration::from_secs(5));
         assert!(output.contains("replay-data-here"));
     }
 
     // Wait for disconnect to be processed
     std::thread::sleep(Duration::from_millis(500));
 
-    // Second client: should get ring buffer replay (Monitor gets replay, Watcher doesn't)
-    let mut stream2 = connect(&id, Role::Monitor);
-    // The first frame after HelloAck is the ring buffer replay
-    stream2
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut replay_contents = String::new();
-    for _ in 0..10 {
-        match Frame::read_from(&mut stream2) {
-            Ok(Some(frame)) if frame.kind == MsgKind::Output => {
-                replay_contents.push_str(&String::from_utf8_lossy(&frame.payload));
-                if replay_contents.contains("replay-data-here") {
-                    break;
+    // The marker has scrolled off the viewport; both read-only roles need the ring.
+    for role in [Role::Monitor, Role::Watcher] {
+        let mut stream2 = connect(&id, role);
+        // The first frame after HelloAck is the ring buffer replay
+        stream2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut replay_contents = String::new();
+        for _ in 0..10 {
+            match Frame::read_from(&mut stream2) {
+                Ok(Some(frame)) if frame.kind == MsgKind::Output => {
+                    replay_contents.push_str(&String::from_utf8_lossy(&frame.payload));
+                    if replay_contents.contains("replay-data-here") {
+                        break;
+                    }
                 }
+                _ => break,
             }
-            _ => break,
         }
+        assert!(
+            replay_contents.contains("replay-data-here"),
+            "Ring buffer replay should contain previous output, got: {}",
+            replay_contents
+        );
     }
-    assert!(
-        replay_contents.contains("replay-data-here"),
-        "Ring buffer replay should contain previous output, got: {}",
-        replay_contents
-    );
-
     cleanup(child, &id);
 }
 
@@ -469,5 +470,34 @@ fn watcher_input_is_ignored() {
         "Watcher input should be silently ignored"
     );
 
+    cleanup(child, &id);
+}
+
+#[test]
+fn readonly_clients_replay_current_alternate_screen() {
+    let id = unique_id("alternate-replay");
+    // Draw once and remain idle: no application redraw can supply the replay.
+    let child = start_broker(
+        &id,
+        "printf '\\033[?1049h\\033[2J\\033[5;10Halternate screen'; sleep 30",
+    );
+    let mut writer = connect(&id, Role::Writer);
+    let initial =
+        read_until_output_contains(&mut writer, "alternate screen", Duration::from_secs(5));
+    assert!(initial.contains("alternate screen"));
+
+    for role in [Role::Monitor, Role::Watcher] {
+        let mut client = connect(&id, role);
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let replay = Frame::read_from(&mut client).unwrap().unwrap();
+        assert_eq!(replay.kind, MsgKind::Output);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&replay.payload);
+        assert!(parser.screen().alternate_screen());
+        assert_eq!(parser.screen().contents().trim(), "alternate screen");
+        assert_eq!(parser.screen().cell(4, 9).unwrap().contents(), "a");
+    }
     cleanup(child, &id);
 }

@@ -209,6 +209,35 @@ class TestIntegration:
 
 
 class TestScreenReader:
+    @pytest.mark.parametrize("role", [Role.MONITOR, Role.WATCHER])
+    def test_alternate_screen_replay_without_resize(self, keepty_bin, role):
+        pytest.importorskip("pyte")
+        import shlex
+        from keepty import ScreenReader
+
+        # Draw once, then overflow raw history with invisible bytes and remain idle.
+        # Record any resize signal in the output.
+        program = (
+            "import signal, time; "
+            "signal.signal(signal.SIGWINCH, lambda *_: print('UNEXPECTED_RESIZE', flush=True)); "
+            "print('\\x1b[?1049h\\x1b[2J\\x1b[5;10Halternate screen', end='', flush=True); "
+            "print('\\x00' * (1024 * 1024 + 100) + '\\x1b]0;REPLAY_READY\\x07', end='', flush=True); "
+            "time.sleep(30)"
+        )
+        sid = unique_id("alternate-screen")
+        child = start_broker(sid, "exec python3 -u -c " + shlex.quote(program))
+        try:
+            with Session.connect(sid, role=Role.WRITER) as writer:
+                assert "REPLAY_READY" in writer.read_until("REPLAY_READY", timeout=5)
+                with ScreenReader.connect(sid, role=role, cols=120, rows=35) as reader:
+                    reader.poll(0.1)
+                    assert "alternate screen" in reader.contents()
+                    assert "UNEXPECTED_RESIZE" not in reader.contents()
+                    assert reader._screen.display[4][9:25] == "alternate screen"
+                    assert (reader._screen.columns, reader._screen.lines) == (80, 24)
+        finally:
+            cleanup(child, sid)
+
     def test_screen_reading(self, keepty_bin):
         """Test the full agent screen-reading flow."""
         pytest.importorskip("pyte")
@@ -217,10 +246,13 @@ class TestScreenReader:
         sid = unique_id("screen")
         child = start_broker(sid, "echo 'screen content here'; sleep 30")
         try:
-            with ScreenReader.connect(sid) as reader:
-                found = reader.poll_until("screen content here", timeout=5)
-                assert found, f"Expected text not found. Screen:\n{reader.contents()}"
-                assert "screen content here" in reader.contents()
+            # The broker defers spawning the child until the first Writer.
+            with Session.connect(sid, role=Role.WRITER) as writer:
+                writer.read_until("screen content here", timeout=5)
+                with ScreenReader.connect(sid) as reader:
+                    found = reader.poll_until("screen content here", timeout=5)
+                    assert found, f"Expected text not found. Screen:\n{reader.contents()}"
+                    assert "screen content here" in reader.contents()
         finally:
             cleanup(child, sid)
 
@@ -239,3 +271,55 @@ class TestScreenReader:
                 assert found
         finally:
             cleanup(child, sid)
+
+
+@pytest.mark.parametrize("role", [Role.MONITOR, Role.WATCHER])
+def test_readonly_prime_does_not_wait_for_nudge(role):
+    from unittest.mock import Mock
+    from keepty.screen import ScreenReader
+
+    session = Mock()
+    session.read_output.return_value = b"replay"
+    stream = Mock()
+    reader = ScreenReader(session, Mock(), stream)
+    reader._prime(role)
+    session.read_output.assert_called_once_with(timeout=0.3)
+    stream.feed.assert_called_once_with(b"replay")
+
+
+def test_watch_detach_resets_terminal_modes(keepty_bin):
+    import pty
+    import select
+
+    sid = unique_id("watch-detach")
+    child = start_broker(sid, "printf '\\033[?1049h\\033[?1000h\\033[?1006h\\033[?1h\\033=\\033[?25lwatch-ready'; sleep 30")
+    master, slave = pty.openpty()
+    attach = None
+    try:
+        with Session.connect(sid, role=Role.WRITER) as writer:
+            assert "watch-ready" in writer.read_until("watch-ready", timeout=5)
+            attach = subprocess.Popen(
+                [KEEPTY_BIN, "attach", sid, "--watch"],
+                stdin=slave, stdout=slave, stderr=slave,
+            )
+            received = bytearray()
+            deadline = time.monotonic() + 5
+            while b"watch-ready" not in received and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    received.extend(os.read(master, 65536))
+            assert b"watch-ready" in received
+            os.write(master, b"\x03")
+            attach.wait(timeout=5)
+            while select.select([master], [], [], 0.1)[0]:
+                received.extend(os.read(master, 65536))
+            for reset in (b"\x1b[?1049l", b"\x1b[?1000l", b"\x1b[?1002l",
+                          b"\x1b[?1003l", b"\x1b[?1006l", b"\x1b[?1l",
+                          b"\x1b>", b"\x1b[?25h"):
+                assert reset in received
+    finally:
+        if attach is not None and attach.poll() is None:
+            attach.kill()
+            attach.wait()
+        os.close(master)
+        os.close(slave)
+        cleanup(child, sid)

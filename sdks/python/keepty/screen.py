@@ -79,7 +79,7 @@ class ScreenReader:
         reader = cls(session, screen, stream)
 
         # Prime the screen: drain replay + nudge re-render.
-        # Writers/Watchers get a nudge that takes ~300ms to produce output.
+        # Writers get a nudge that takes ~300ms to produce output.
         # We drain until output settles to ensure the full re-render is captured.
         reader._prime(role)
 
@@ -92,15 +92,15 @@ class ScreenReader:
 
     def _prime(self, role: Role) -> None:
         """Drain initial output (replay + nudge re-render)."""
-        # First drain: ring buffer replay
+        # First drain: ring or alternate-screen replay
         try:
             data = self._session.read_output(timeout=0.3)
             self._feed(data)
         except SessionExited:
             return
 
-        # For Writer/Watcher: wait for nudge re-render to arrive
-        if role in (Role.WRITER, Role.WATCHER):
+        # Writers wait for nudge re-render to arrive
+        if role == Role.WRITER:
             deadline = time.monotonic() + 1.5
             saw_output = False
             quiet_since = None

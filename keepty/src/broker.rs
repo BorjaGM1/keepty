@@ -29,6 +29,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
+fn replay_frames(data: &[u8]) -> impl Iterator<Item = Arc<[u8]>> + '_ {
+    data.chunks(keepty_protocol::MAX_PAYLOAD_SIZE)
+        .map(|chunk| Frame::new(MsgKind::Output, chunk.to_vec()).encode().into())
+}
+
 fn log(msg: &str) {
     eprintln!("[keepty] {}", msg);
 }
@@ -100,7 +105,7 @@ struct BrokerState {
     output: Mutex<OutputState>,
     writer_id: AtomicU32, // 0 = no writer
     next_client_id: AtomicU32,
-    /// Virtual screen for watcher replay. Fed the same bytes as the ring buffer.
+    /// Virtual screen for read-only client replay. Fed the same bytes as the ring buffer.
     screen: Mutex<vt100::Parser>,
     running: AtomicBool,
     pty_pid: AtomicU32,
@@ -251,10 +256,8 @@ fn start_pty_reader(
                     let data = &buf[..n];
 
                     // Lock ordering: screen → output (never hold output across socket I/O)
-                    {
-                        let mut screen = state.screen.lock().unwrap();
-                        screen.process(data);
-                    }
+                    let mut screen = state.screen.lock().unwrap();
+                    screen.process(data);
 
                     let output_frame = Frame::new(MsgKind::Output, data.to_vec());
                     let encoded: Arc<[u8]> = output_frame.encode().into();
@@ -768,31 +771,31 @@ fn handle_client(
         let stream_clone = stream.try_clone()?;
         let _drain = spawn_client_drain(client_id, rx, stream_clone, state.clone());
 
-        // Register + replay under the output lock (prevents replay/live duplication)
+        // Snapshot + register atomically with PTY processing, in screen → output
+        // lock order, so live bytes cannot be duplicated or missed after replay.
         {
+            let screen = state.screen.lock().unwrap();
             let mut out = state.output.lock().unwrap();
 
-            if role == Role::Watcher {
-                // Watchers: skip raw ring replay (garbled for cursor-addressed TUIs).
-                // After registration, we'll nudge the child to re-render.
+            let replay_data = if role != Role::Writer && screen.screen().alternate_screen() {
+                // TODO: restore the inactive primary buffer and DECSTBM/DECOM state.
+                let mut data = b"\x1b[?1049h".to_vec();
+                data.extend(screen.screen().state_formatted());
+                data
             } else {
-                // Writers/Monitors: raw ring buffer replay via channel.
-                let replay_data = out.ring.recent();
-                if !replay_data.is_empty() {
-                    let replay = Frame::new(MsgKind::Output, replay_data);
-                    let encoded: Arc<[u8]> = replay.encode().into();
-                    let _ = tx.try_send(encoded);
-                }
+                // Preserve primary-screen scrollback for every role.
+                out.ring.recent()
+            };
+            for encoded in replay_frames(&replay_data) {
+                let _ = tx.try_send(encoded);
             }
 
             out.clients.insert(client_id, ClientSender { tx, role });
         }
 
-        // Watcher / reattached-writer redraw nudge: raw ring replay alone does
-        // not reconstruct cursor-addressed TUI state. Reattached writers keep
-        // replay (preserves shell scrollback), then get the same double-resize
-        // trick as watchers to force a fresh render from the child.
-        if role == Role::Watcher || role == Role::Writer {
+        // Reattached writers retain the resize nudge to refresh their terminal.
+        // Read-only clients reconstruct the screen without affecting the child.
+        if role == Role::Writer {
             let pid = state.pty_pid.load(Ordering::SeqCst);
             if pid > 0 && spawned.load(Ordering::SeqCst) {
                 let current_cols = *state.cols.read().unwrap();
@@ -1007,6 +1010,25 @@ fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::RingBuffer;
+
+    #[test]
+    fn oversized_replay_is_split_into_valid_frames() {
+        use keepty_protocol::{Frame, MsgKind, MAX_PAYLOAD_SIZE};
+        let data: Vec<u8> = (0..MAX_PAYLOAD_SIZE * 2 + 17)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let frames: Vec<_> = super::replay_frames(&data).collect();
+        assert_eq!(frames.len(), 3);
+        let mut restored = Vec::new();
+        for encoded in frames {
+            let frame = Frame::read_from(&mut &encoded[..]).unwrap().unwrap();
+            assert_eq!(frame.kind, MsgKind::Output);
+            assert!(frame.payload.len() <= MAX_PAYLOAD_SIZE);
+            restored.extend(frame.payload);
+        }
+        assert_eq!(restored, data);
+        assert_eq!(super::replay_frames(&[]).count(), 0);
+    }
 
     #[test]
     fn ring_buffer_basic() {
