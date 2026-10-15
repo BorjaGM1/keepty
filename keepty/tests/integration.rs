@@ -1246,3 +1246,121 @@ time.sleep(30)'"#,
         cleanup(child, &id);
     }
 }
+
+/// Slow actual socket reads, including within coalesced frames.
+struct SlowReader(UnixStream);
+impl std::io::Read for SlowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(1));
+        let len = buf.len().min(4096);
+        std::io::Read::read(&mut self.0, &mut buf[..len])
+    }
+}
+
+#[test]
+fn slow_monitor_preserves_output_resize_fence_and_exit() {
+    let id = unique_id("slow-monitor");
+    let child = start_broker(&id, "stty -echo; python3 -c 'import os; input(); os.write(1, b\"0123456789abcdef\" * 327680); input(); os.write(1, b\"AFTER\")'");
+    let monitor = connect(&id, Role::Monitor);
+    monitor
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        let mut slow = SlowReader(monitor);
+        let mut bytes = Vec::new();
+        let mut fence = None;
+        loop {
+            let frame = Frame::read_from(&mut slow).unwrap().expect("premature EOF");
+            match frame.kind {
+                MsgKind::Output => bytes.extend(frame.payload),
+                MsgKind::ResizeAck => fence = Some(bytes.len()),
+                MsgKind::Exit => break,
+                _ => {}
+            }
+        }
+        (bytes, fence)
+    });
+    let mut writer = connect(&id, Role::Writer);
+    writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Wait for stty to disable echo before sending the release line.
+    std::thread::sleep(Duration::from_millis(200));
+    Frame::new(MsgKind::Input, b"\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    let expected = b"0123456789abcdef".repeat(327680);
+    let mut received = Vec::new();
+    while received.len() < expected.len() {
+        let frame = Frame::read_from(&mut writer).unwrap().unwrap();
+        if frame.kind == MsgKind::Output {
+            received.extend(frame.payload);
+        }
+    }
+    assert_eq!(received, expected);
+    Frame::new(MsgKind::Resize, encode_resize(81, 25))
+        .write_to(&mut writer)
+        .unwrap();
+    loop {
+        if Frame::read_from(&mut writer).unwrap().unwrap().kind == MsgKind::ResizeAck {
+            break;
+        }
+    }
+    Frame::new(MsgKind::Input, b"\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    let (mut bytes, fence) = reader.join().unwrap();
+    assert_eq!(fence, Some(expected.len()));
+    assert_eq!(bytes.split_off(expected.len()), b"AFTER");
+    assert_eq!(bytes, expected);
+    cleanup(child, &id);
+}
+
+#[test]
+fn unread_monitor_is_evicted_without_blocking_writer() {
+    let id = unique_id("stuck-monitor");
+    let mut child = start_broker(&id, "stty -echo; python3 -c 'import os; input(); os.write(1, b\"x\" * (24 * 1024 * 1024)); input()'");
+    let mut monitor = connect(&id, Role::Monitor);
+    let mut writer = connect(&id, Role::Writer);
+    writer
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    Frame::new(MsgKind::Input, b"\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    let mut total = 0;
+    while total < 24 * 1024 * 1024 {
+        let frame = Frame::read_from(&mut writer)
+            .unwrap()
+            .expect("writer evicted");
+        if frame.kind == MsgKind::Output {
+            assert!(frame.payload.iter().all(|&b| b == b'x'));
+            total += frame.payload.len();
+        }
+    }
+    // Leave the monitor frozen through the socket write timeout, then verify
+    // EOF and the bound-eviction log (rather than just a drain timeout).
+    std::thread::sleep(Duration::from_secs(6));
+    monitor
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    while Frame::read_from(&mut monitor).unwrap().is_some() {}
+    Frame::new(MsgKind::Ping, vec![])
+        .write_to(&mut writer)
+        .unwrap();
+    assert_eq!(
+        Frame::read_from(&mut writer).unwrap().unwrap().kind,
+        MsgKind::Pong
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut logs = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut logs).unwrap();
+    assert!(
+        logs.contains("evicted (queue full or disconnected)"),
+        "{logs}"
+    );
+    cleanup(child, &id);
+}

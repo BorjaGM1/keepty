@@ -20,13 +20,13 @@ use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 
 fn replay_frames(data: &[u8]) -> impl Iterator<Item = Arc<[u8]>> + '_ {
@@ -83,10 +83,88 @@ impl RingBuffer {
     }
 }
 
-/// Per-client outbound channel sender.
+/// One ordered, byte-bounded queue per client. Adjacent output is coalesced,
+/// while control frames remain fences between output batches.
+#[derive(Default)]
+struct ClientQueue {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct Pending {
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+    finished: bool,
+}
+
+impl ClientQueue {
+    fn send(&self, encoded: Arc<[u8]>) -> Result<(), ()> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.closed || pending.bytes + encoded.len() > CLIENT_QUEUE_BYTES {
+            return Err(());
+        }
+        pending.bytes += encoded.len();
+        let mut payload = &encoded[6..];
+        if encoded[5] == MsgKind::Output as u8 {
+            if let Some(tail) = pending.frames.back_mut() {
+                if tail[5] == MsgKind::Output as u8 {
+                    let count = payload
+                        .len()
+                        .min(keepty_protocol::MAX_PAYLOAD_SIZE + 6 - tail.len());
+                    tail.extend_from_slice(&payload[..count]);
+                    let len = (tail.len() - 4) as u32;
+                    tail[..4].copy_from_slice(&len.to_be_bytes());
+                    payload = &payload[count..];
+                    if payload.is_empty() {
+                        pending.bytes -= 6;
+                        self.ready.notify_one();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if payload.len() == encoded.len() - 6 {
+            pending.frames.push_back(encoded.to_vec());
+        } else {
+            pending
+                .frames
+                .push_back(Frame::new(MsgKind::Output, payload.to_vec()).encode());
+        }
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<Vec<u8>> {
+        let mut pending = self.pending.lock().unwrap();
+        loop {
+            if let Some(frame) = pending.frames.pop_front() {
+                pending.bytes -= frame.len();
+                return Some(frame);
+            }
+            if pending.closed {
+                return None;
+            }
+            pending = self.ready.wait(pending).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        self.pending.lock().unwrap().closed = true;
+        self.ready.notify_one();
+    }
+}
+
 struct ClientSender {
-    tx: std::sync::mpsc::SyncSender<Arc<[u8]>>,
+    tx: Arc<ClientQueue>,
     role: Role,
+}
+
+impl Drop for ClientSender {
+    fn drop(&mut self) {
+        self.tx.close();
+    }
 }
 
 /// Combined output state: ring buffer + client senders.
@@ -98,7 +176,7 @@ struct OutputState {
 
 const MAX_CONNECTIONS: u32 = 32;
 const HELLO_TIMEOUT_SECS: u64 = 5;
-const CLIENT_QUEUE_BOUND: usize = 64; // ~1MB at 16KB/frame
+const CLIENT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Shared broker state
 struct BrokerState {
@@ -120,7 +198,7 @@ struct BrokerState {
 fn spawn_client_drain(
     client_id: u32,
     previous_writer_id: u32,
-    rx: std::sync::mpsc::Receiver<Arc<[u8]>>,
+    rx: Arc<ClientQueue>,
     mut stream: UnixStream,
     state: Arc<BrokerState>,
 ) -> thread::JoinHandle<()> {
@@ -129,11 +207,14 @@ fn spawn_client_drain(
         .set_write_timeout(Some(std::time::Duration::from_secs(5)))
         .ok();
     thread::spawn(move || {
-        for data in rx.iter() {
+        while let Some(data) = rx.recv() {
             if stream.write_all(&data).is_err() {
                 break;
             }
         }
+        rx.close();
+        rx.pending.lock().unwrap().finished = true;
+        rx.ready.notify_all();
         // Clean up on disconnect
         let mut out = state.output.lock().unwrap();
         if out.clients.remove(&client_id).is_some() {
@@ -300,7 +381,7 @@ fn start_pty_reader(
 
                     let mut dead = Vec::new();
                     for (&id, client) in out.clients.iter() {
-                        if client.tx.try_send(encoded.clone()).is_err() {
+                        if client.tx.send(encoded.clone()).is_err() {
                             dead.push(id);
                         }
                     }
@@ -593,19 +674,31 @@ pub fn run() -> Result<()> {
 
     // Broadcast Exit to all clients via channels, then drop senders.
     // Dropping senders closes channels, causing drain threads to flush and exit.
-    {
+    let drains = {
         let exit_frame = Frame::new(MsgKind::Exit, encode_exit(exit_code));
         let encoded: Arc<[u8]> = exit_frame.encode().into();
         let mut out = state.output.lock().unwrap();
         for client in out.clients.values() {
-            // Use blocking send for Exit — we want it delivered, not dropped
+            // Exit follows all previously queued output.
             let _ = client.tx.send(encoded.clone());
         }
-        out.clients.clear(); // Drops all senders → drain threads will exit after flushing
-    }
+        let drains: Vec<_> = out
+            .clients
+            .values()
+            .map(|client| client.tx.clone())
+            .collect();
+        out.clients.clear(); // Close queues after the ordered Exit.
+        drains
+    };
 
-    // Give drain threads time to flush the Exit frame before process exit
-    thread::sleep(std::time::Duration::from_millis(200));
+    // Each socket write retains its five-second timeout. Let healthy clients
+    // receive all queued output and Exit before terminating the process.
+    for queue in drains {
+        let mut pending = queue.pending.lock().unwrap();
+        while !pending.finished {
+            pending = queue.ready.wait(pending).unwrap();
+        }
+    }
 
     let _ = std::fs::remove_file(&sock_path);
     log("Broker shutting down");
@@ -730,7 +823,8 @@ fn handle_client(
         ack.write_to(&mut stream)?;
 
         // Set up per-client outbound channel + drain thread
-        let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE_BOUND);
+        let tx = Arc::new(ClientQueue::default());
+        let rx = tx.clone();
         let stream_clone = stream.try_clone()?;
         let _drain = spawn_client_drain(
             client_id,
@@ -811,7 +905,8 @@ fn handle_client(
         ack.write_to(&mut stream)?;
 
         // Set up per-client outbound channel + drain thread
-        let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE_BOUND);
+        let tx = Arc::new(ClientQueue::default());
+        let rx = tx.clone();
         let stream_clone = stream.try_clone()?;
         let _drain = spawn_client_drain(
             client_id,
@@ -837,7 +932,7 @@ fn handle_client(
                 out.ring.recent()
             };
             for encoded in replay_frames(&replay_data) {
-                let _ = tx.try_send(encoded);
+                let _ = tx.send(encoded);
             }
             if role == Role::Writer {
                 // A wrapped ring can end inside an escape sequence. Cancel it
@@ -845,7 +940,7 @@ fn handle_client(
                 // Keep this after replay so stale mode toggles cannot override it.
                 let mut modes = vec![0x18]; // CAN resets the terminal parser state
                 modes.extend(screen.screen().input_mode_formatted());
-                let _ = tx.try_send(Frame::new(MsgKind::Output, modes).encode().into());
+                let _ = tx.send(Frame::new(MsgKind::Output, modes).encode().into());
             }
 
             out.clients.insert(client_id, ClientSender { tx, role });
@@ -955,12 +1050,17 @@ fn handle_client(
                         let encoded: Arc<[u8]> = ack.encode().into();
                         let mut dead_ack = Vec::new();
                         for (&id, client) in out.clients.iter() {
-                            if client.tx.try_send(encoded.clone()).is_err() {
+                            if client.tx.send(encoded.clone()).is_err() {
                                 dead_ack.push(id);
                             }
                         }
                         for id in dead_ack {
-                            out.clients.remove(&id);
+                            if let Some(c) = out.clients.remove(&id) {
+                                log(&format!(
+                                    "Client {} ({:?}) evicted (queue full or disconnected)",
+                                    id, c.role
+                                ));
+                            }
                             let _ = state.writer_id.compare_exchange(
                                 id,
                                 0,
@@ -1042,14 +1142,10 @@ fn handle_client(
             MsgKind::Ping => {
                 let pong = Frame::new(MsgKind::Pong, Vec::new());
                 let encoded: Arc<[u8]> = pong.encode().into();
-                let tx = {
-                    let out = state.output.lock().unwrap();
-                    out.clients.get(&client_id).map(|client| client.tx.clone())
-                };
-                // Preserve the acknowledgement under backpressure without holding
-                // the output lock while the drain thread frees queue space.
-                if let Some(tx) = tx {
-                    if tx.send(encoded).is_err() {
+                let mut out = state.output.lock().unwrap();
+                if let Some(client) = out.clients.get(&client_id) {
+                    if client.tx.send(encoded).is_err() {
+                        out.clients.remove(&client_id);
                         break;
                     }
                 }
