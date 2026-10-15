@@ -24,6 +24,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -85,8 +86,8 @@ impl RingBuffer {
 
 /// One ordered, byte-bounded queue per client. Adjacent output is coalesced,
 /// while control frames remain fences between output batches.
-#[derive(Default)]
 struct ClientQueue {
+    socket: UnixStream,
     pending: Mutex<Pending>,
     ready: Condvar,
 }
@@ -97,14 +98,39 @@ struct Pending {
     bytes: usize,
     closed: bool,
     finished: bool,
+    exit_queued: bool,
+    shutdown_deadline: Option<std::time::Instant>,
 }
 
 impl ClientQueue {
+    fn new(socket: UnixStream) -> Self {
+        Self {
+            socket,
+            pending: Mutex::new(Pending::default()),
+            ready: Condvar::new(),
+        }
+    }
+
     fn send(&self, encoded: Arc<[u8]>) -> Result<(), ()> {
         let mut pending = self.pending.lock().unwrap();
-        if pending.closed || pending.bytes + encoded.len() > CLIENT_QUEUE_BYTES {
+        let is_output = encoded[5] == MsgKind::Output as u8;
+        let fully_merged = is_output
+            && pending.frames.back().is_some_and(|tail| {
+                tail[5] == MsgKind::Output as u8
+                    && encoded.len() - 6 <= keepty_protocol::MAX_PAYLOAD_SIZE + 6 - tail.len()
+            });
+        let delta = encoded.len() - if fully_merged { 6 } else { 0 };
+        let is_exit = encoded[5] == MsgKind::Exit as u8;
+        let control = matches!(encoded[5],
+            kind if kind == MsgKind::Pong as u8 || kind == MsgKind::ResizeAck as u8);
+        let limit = CLIENT_QUEUE_BYTES + if control { CONTROL_SLACK } else { 0 };
+        if pending.closed
+            || (is_exit && pending.exit_queued)
+            || (!is_exit && pending.bytes.checked_add(delta).is_none_or(|n| n > limit))
+        {
             return Err(());
         }
+        pending.exit_queued |= is_exit;
         pending.bytes += encoded.len();
         let mut payload = &encoded[6..];
         if encoded[5] == MsgKind::Output as u8 {
@@ -139,6 +165,17 @@ impl ClientQueue {
     fn recv(&self) -> Option<Vec<u8>> {
         let mut pending = self.pending.lock().unwrap();
         loop {
+            if pending
+                .shutdown_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                // At a frame boundary, retain only the terminal Exit. No bytes
+                // from discarded frames have reached the socket.
+                pending
+                    .frames
+                    .retain(|frame| frame[5] == MsgKind::Exit as u8);
+                pending.bytes = pending.frames.iter().map(Vec::len).sum();
+            }
             if let Some(frame) = pending.frames.pop_front() {
                 pending.bytes -= frame.len();
                 return Some(frame);
@@ -177,6 +214,10 @@ struct OutputState {
 const MAX_CONNECTIONS: u32 = 32;
 const HELLO_TIMEOUT_SECS: u64 = 5;
 const CLIENT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const CONTROL_SLACK: usize = 64 * 1024;
+const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
+const EXIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Shared broker state
 struct BrokerState {
@@ -208,6 +249,11 @@ fn spawn_client_drain(
         .ok();
     thread::spawn(move || {
         while let Some(data) = rx.recv() {
+            if data[5] == MsgKind::Exit as u8 {
+                stream.set_write_timeout(Some(EXIT_WRITE_TIMEOUT)).ok();
+            }
+            // A failed write_all may have sent a prefix. Never append another
+            // frame after that failure.
             if stream.write_all(&data).is_err() {
                 break;
             }
@@ -511,6 +557,9 @@ pub fn run() -> Result<()> {
 
     // Listen on Unix socket with restricted permissions (0600)
     let listener = UnixListener::bind(&sock_path).context("Failed to bind socket")?;
+    let socket_metadata =
+        std::fs::symlink_metadata(&sock_path).context("Failed to stat bound socket")?;
+    let socket_identity = (socket_metadata.dev(), socket_metadata.ino());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -544,6 +593,7 @@ pub fn run() -> Result<()> {
     let pty_read_handle_accept = pty_read_handle.clone();
     let spawned_accept = spawned.clone();
 
+    let accept_sock_path = sock_path.clone();
     let accept_thread = thread::spawn(move || {
         loop {
             if !state_accept.running.load(Ordering::SeqCst) {
@@ -612,6 +662,14 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        drop(listener);
+        // Only unlink our bound socket, as soon as the listener closes.
+        // stat + unlink has a tiny residual TOCTOU; Unix has no conditional unlink.
+        if let Ok(metadata) = std::fs::symlink_metadata(&accept_sock_path) {
+            if (metadata.dev(), metadata.ino()) == socket_identity {
+                let _ = std::fs::remove_file(&accept_sock_path);
+            }
+        }
     });
 
     // Wait for child to exit OR signal. Poll until child is spawned, then wait on it.
@@ -674,13 +732,17 @@ pub fn run() -> Result<()> {
 
     // Broadcast Exit to all clients via channels, then drop senders.
     // Dropping senders closes channels, causing drain threads to flush and exit.
+    let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
     let drains = {
         let exit_frame = Frame::new(MsgKind::Exit, encode_exit(exit_code));
         let encoded: Arc<[u8]> = exit_frame.encode().into();
         let mut out = state.output.lock().unwrap();
         for client in out.clients.values() {
-            // Exit follows all previously queued output.
-            let _ = client.tx.send(encoded.clone());
+            client.tx.pending.lock().unwrap().shutdown_deadline = Some(deadline);
+            // Exit follows output unless the drain reaches the deadline.
+            if client.tx.send(encoded.clone()).is_err() {
+                log("Could not queue Exit: client queue is closed");
+            }
         }
         let drains: Vec<_> = out
             .clients
@@ -691,16 +753,28 @@ pub fn run() -> Result<()> {
         drains
     };
 
-    // Each socket write retains its five-second timeout. Let healthy clients
-    // receive all queued output and Exit before terminating the process.
-    for queue in drains {
+    // One budget for all clients, even when several readers keep making slow
+    // progress (a per-write timeout alone cannot bound the total drain time).
+    let fallback_deadline = deadline + SHUTDOWN_DRAIN_GRACE;
+    for queue in &drains {
         let mut pending = queue.pending.lock().unwrap();
         while !pending.finished {
-            pending = queue.ready.wait(pending).unwrap();
+            let remaining = fallback_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            pending = queue.ready.wait_timeout(pending, remaining).unwrap().0;
+        }
+    }
+    for queue in &drains {
+        if !queue.pending.lock().unwrap().finished {
+            // Interrupt an in-flight write through the cloned socket handle.
+            // Do not append Exit here: Output may have been only partly written.
+            let _ = queue.socket.shutdown(Shutdown::Both);
         }
     }
 
-    let _ = std::fs::remove_file(&sock_path);
+    // The accept thread already removed our socket; never unlink again after drain.
     log("Broker shutting down");
 
     let _ = accept_thread.join();
@@ -823,7 +897,7 @@ fn handle_client(
         ack.write_to(&mut stream)?;
 
         // Set up per-client outbound channel + drain thread
-        let tx = Arc::new(ClientQueue::default());
+        let tx = Arc::new(ClientQueue::new(stream.try_clone()?));
         let rx = tx.clone();
         let stream_clone = stream.try_clone()?;
         let _drain = spawn_client_drain(
@@ -905,7 +979,7 @@ fn handle_client(
         ack.write_to(&mut stream)?;
 
         // Set up per-client outbound channel + drain thread
-        let tx = Arc::new(ClientQueue::default());
+        let tx = Arc::new(ClientQueue::new(stream.try_clone()?));
         let rx = tx.clone();
         let stream_clone = stream.try_clone()?;
         let _drain = spawn_client_drain(
@@ -1174,6 +1248,131 @@ fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::RingBuffer;
+
+    fn queue_at(bytes: usize) -> super::ClientQueue {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let queue = super::ClientQueue::new(socket);
+        // Seed full output batches, then approach the cap with one-byte sends.
+        let mut remaining = bytes;
+        while remaining > 7 {
+            let payload = (remaining - 7).min(keepty_protocol::MAX_PAYLOAD_SIZE);
+            queue
+                .send(
+                    keepty_protocol::Frame::new(
+                        keepty_protocol::MsgKind::Output,
+                        vec![b'a'; payload],
+                    )
+                    .encode()
+                    .into(),
+                )
+                .unwrap();
+            remaining = bytes - queue.pending.lock().unwrap().bytes;
+        }
+        let byte =
+            keepty_protocol::Frame::new(keepty_protocol::MsgKind::Output, vec![b'a']).encode();
+        while queue.pending.lock().unwrap().bytes < bytes {
+            queue.send(byte.clone().into()).unwrap();
+        }
+        queue
+    }
+
+    #[test]
+    fn client_queue_exit_survives_cap_and_close_preserves_order() {
+        use keepty_protocol::{Frame, MsgKind};
+        let queue = queue_at(super::CLIENT_QUEUE_BYTES - 1);
+        let exit = Frame::new(MsgKind::Exit, super::encode_exit(0)).encode();
+        queue.send(exit.clone().into()).unwrap();
+        assert_eq!(
+            queue.pending.lock().unwrap().bytes,
+            super::CLIENT_QUEUE_BYTES - 1 + exit.len()
+        );
+        queue.close();
+        assert!(queue.send(exit.clone().into()).is_err());
+        let mut last = Vec::new();
+        while let Some(frame) = queue.recv() {
+            last = frame;
+        }
+        assert_eq!(last, exit);
+        assert_eq!(queue.pending.lock().unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn client_queue_control_replies_survive_full_queue() {
+        use keepty_protocol::{Frame, MsgKind};
+        let queue = queue_at(super::CLIENT_QUEUE_BYTES);
+        for (kind, payload) in [(MsgKind::Pong, vec![]), (MsgKind::ResizeAck, vec![0; 8])] {
+            let encoded = Frame::new(kind, payload).encode();
+            let before = queue.pending.lock().unwrap().bytes;
+            queue.send(encoded.clone().into()).unwrap();
+            let pending = queue.pending.lock().unwrap();
+            assert!(!pending.closed);
+            assert_eq!(pending.bytes, before + encoded.len());
+            assert_eq!(pending.frames.back().unwrap(), &encoded);
+        }
+        let output = Frame::new(MsgKind::Output, vec![b'b']).encode();
+        assert!(queue.send(output.into()).is_err());
+        queue.close();
+        for kind in [MsgKind::Pong, MsgKind::ResizeAck] {
+            assert!(queue
+                .send(Frame::new(kind, vec![]).encode().into())
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn client_queue_ping_flood_has_bounded_control_slack() {
+        use keepty_protocol::{Frame, MsgKind};
+        let queue = queue_at(super::CLIENT_QUEUE_BYTES);
+        let pong: std::sync::Arc<[u8]> = Frame::new(MsgKind::Pong, vec![]).encode().into();
+        let mut admitted = 0;
+        while queue.send(pong.clone()).is_ok() {
+            admitted += pong.len();
+            assert!(admitted <= super::CONTROL_SLACK);
+        }
+        assert_eq!(admitted, super::CONTROL_SLACK / pong.len() * pong.len());
+        let exit = Frame::new(MsgKind::Exit, super::encode_exit(0)).encode();
+        queue.send(exit.clone().into()).unwrap();
+        assert!(queue.send(exit.into()).is_err());
+        assert!(
+            queue.pending.lock().unwrap().bytes
+                <= super::CLIENT_QUEUE_BYTES + super::CONTROL_SLACK + 10
+        );
+    }
+
+    #[test]
+    fn expired_queue_discards_output_at_boundary_and_keeps_exit() {
+        use keepty_protocol::{Frame, MsgKind};
+        let queue = queue_at(1024);
+        let exit = Frame::new(MsgKind::Exit, super::encode_exit(0)).encode();
+        queue.send(exit.clone().into()).unwrap();
+        queue.pending.lock().unwrap().shutdown_deadline = Some(std::time::Instant::now());
+        queue.close();
+        assert_eq!(queue.recv().unwrap(), exit);
+        assert!(queue.recv().is_none());
+    }
+
+    #[test]
+    fn client_queue_coalesced_output_uses_post_merge_size() {
+        use keepty_protocol::{Frame, MsgKind};
+        let queue = queue_at(super::CLIENT_QUEUE_BYTES - 6);
+        let byte = Frame::new(MsgKind::Output, vec![b'b']).encode();
+        let frames = queue.pending.lock().unwrap().frames.len();
+        for _ in 0..6 {
+            queue.send(byte.clone().into()).unwrap();
+        }
+        assert!(queue.send(byte.into()).is_err());
+        let pending = queue.pending.lock().unwrap();
+        assert_eq!(pending.bytes, super::CLIENT_QUEUE_BYTES);
+        assert_eq!(pending.frames.len(), frames);
+        assert_eq!(
+            pending.bytes,
+            pending.frames.iter().map(Vec::len).sum::<usize>()
+        );
+        let tail = Frame::read_from(&mut &pending.frames.back().unwrap()[..])
+            .unwrap()
+            .unwrap();
+        assert!(tail.payload.ends_with(b"bbbbbb"));
+    }
 
     #[test]
     fn oversized_replay_is_split_into_valid_frames() {

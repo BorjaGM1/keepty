@@ -1318,6 +1318,80 @@ fn slow_monitor_preserves_output_resize_fence_and_exit() {
 }
 
 #[test]
+fn stop_bounds_slow_monitor_shutdown() {
+    use std::time::Instant;
+
+    let id = unique_id("slow-stop");
+    let mut child = start_broker(&id, "stty -echo; python3 -c 'import os; input(); os.write(1, b\"x\" * (12 * 1024 * 1024)); input()'");
+    let monitor = connect(&id, Role::Monitor);
+    monitor
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let reader = std::thread::spawn(move || {
+        struct SlowReader(std::os::unix::net::UnixStream);
+        impl std::io::Read for SlowReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let limit = buf.len().min(16 * 1024);
+                let n = std::io::Read::read(&mut self.0, &mut buf[..limit])?;
+                std::thread::sleep(Duration::from_secs_f64(n as f64 / (2.0 * 1024.0 * 1024.0)));
+                Ok(n)
+            }
+        }
+        let mut monitor = SlowReader(monitor);
+        let mut total = 0;
+        let mut last = None;
+        loop {
+            let frame = Frame::read_from(&mut monitor).expect("slow monitor received a torn frame");
+            let Some(frame) = frame else {
+                assert_eq!(last, Some(MsgKind::Exit));
+                return total;
+            };
+            assert_ne!(last, Some(MsgKind::Exit), "frame after Exit");
+            last = Some(frame.kind);
+            if frame.kind == MsgKind::Output {
+                total += frame.payload.len();
+            }
+        }
+    });
+    let mut writer = connect(&id, Role::Writer);
+    writer
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    Frame::new(MsgKind::Input, b"\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    let mut total = 0;
+    while total < 12 * 1024 * 1024 {
+        let frame = Frame::read_from(&mut writer).unwrap().expect("writer EOF");
+        if frame.kind == MsgKind::Output {
+            total += frame.payload.len();
+        }
+    }
+    // The writer has observed all 12 MiB, while the Monitor has only consumed
+    // small reads. More than 8 MiB is still pending for that live client.
+    let started = Instant::now();
+    let mut stop = Command::new(keepty_bin())
+        .args(["stop", &id])
+        .spawn()
+        .unwrap();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(4) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("broker did not exit within four seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(stop.wait().unwrap().success());
+    assert!(!std::path::Path::new(&socket_path(&id)).exists());
+    assert!(reader.join().unwrap() < 12 * 1024 * 1024);
+}
+
+#[test]
 fn unread_monitor_is_evicted_without_blocking_writer() {
     let id = unique_id("stuck-monitor");
     let mut child = start_broker(&id, "stty -echo; python3 -c 'import os; input(); os.write(1, b\"x\" * (24 * 1024 * 1024)); input()'");
@@ -1363,4 +1437,161 @@ fn unread_monitor_is_evicted_without_blocking_writer() {
         "{logs}"
     );
     cleanup(child, &id);
+}
+
+#[test]
+fn stop_then_start_same_id_after_heavy_output() {
+    let id = unique_id("stop-restart");
+    let mut child = start_broker(&id, "bash --norc");
+    let mut writer = connect(&id, Role::Writer);
+    writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    Frame::new(MsgKind::Input, b"seq 100000; echo HEAVY_DONE\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    // Match the final sequence line as well, so echoed input cannot satisfy it.
+    assert!(read_until_output_contains(
+        &mut writer,
+        "100000\r\nHEAVY_DONE",
+        Duration::from_secs(10)
+    )
+    .contains("100000\r\nHEAVY_DONE"));
+    drop(writer);
+    let stopped = Command::new(keepty_bin())
+        .args(["stop", &id])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(!String::from_utf8_lossy(&stopped.stderr).contains("Warning:"));
+    let restarted = Command::new(keepty_bin())
+        .args(["start", &id, "--", "bash", "--norc"])
+        .output()
+        .unwrap();
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let mut writer = connect(&id, Role::Writer);
+    writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    Frame::new(MsgKind::Input, b"printf 'RESTART_%s\\n' WORKS\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    assert!(
+        read_until_output_contains(&mut writer, "RESTART_WORKS", Duration::from_secs(5))
+            .contains("RESTART_WORKS")
+    );
+    assert!(Command::new(keepty_bin())
+        .args(["stop", &id])
+        .status()
+        .unwrap()
+        .success());
+    let _ = child.wait();
+}
+
+#[test]
+fn start_during_shutdown_survives() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::Instant;
+
+    let id = unique_id("shutdown-rebind");
+    let mut first = start_broker(&id, "stty -echo; python3 -c 'import os; input(); os.write(1, b\"x\" * (12 * 1024 * 1024)); input()'");
+    let monitor = connect(&id, Role::Monitor);
+    // Keep a reader far below the output rate, forcing A to drain after closing
+    // its listener. Raw reads tolerate the intentional partial-frame fallback.
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut monitor = monitor;
+        monitor
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buffer = [0; 4096];
+        while let Ok(n) = monitor.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let mut writer = connect(&id, Role::Writer);
+    writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    Frame::new(MsgKind::Input, b"\n".to_vec())
+        .write_to(&mut writer)
+        .unwrap();
+    let mut total = 0;
+    while total < 12 * 1024 * 1024 {
+        let frame = Frame::read_from(&mut writer).unwrap().expect("writer EOF");
+        if frame.kind == MsgKind::Output {
+            total += frame.payload.len();
+        }
+    }
+    let sock = socket_path(&id);
+    let old = std::fs::symlink_metadata(&sock).unwrap();
+    let mut stop = Command::new(keepty_bin())
+        .args(["stop", &id])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while UnixStream::connect(&sock).is_ok() {
+        assert!(Instant::now() < deadline, "A listener never closed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "A exited before rebind"
+    );
+    let started = Command::new(keepty_bin())
+        .args(["start", &id, "--", "bash", "--norc"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let replacement = std::fs::symlink_metadata(&sock).unwrap();
+    assert_ne!(
+        (old.dev(), old.ino()),
+        (replacement.dev(), replacement.ino())
+    );
+    assert!(stop.wait().unwrap().success());
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut stop.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!stderr.contains("Warning:"), "{stderr}");
+    first.wait().unwrap();
+    let after = std::fs::symlink_metadata(&sock).expect("A deleted B's socket");
+    assert_eq!(
+        (replacement.dev(), replacement.ino()),
+        (after.dev(), after.ino())
+    );
+    let mut second_writer = connect(&id, Role::Writer);
+    second_writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    Frame::new(
+        MsgKind::Input,
+        b"printf 'SURVIVED_%s\\n' SHUTDOWN\n".to_vec(),
+    )
+    .write_to(&mut second_writer)
+    .unwrap();
+    assert!(read_until_output_contains(
+        &mut second_writer,
+        "SURVIVED_SHUTDOWN",
+        Duration::from_secs(5)
+    )
+    .contains("SURVIVED_SHUTDOWN"));
+    assert!(Command::new(keepty_bin())
+        .args(["stop", &id])
+        .status()
+        .unwrap()
+        .success());
+    drop(writer);
+    reader.join().unwrap();
 }

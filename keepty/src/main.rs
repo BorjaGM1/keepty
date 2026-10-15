@@ -308,7 +308,12 @@ fn cmd_stop(args: &[String]) -> i32 {
         }
     };
 
+    use std::os::unix::fs::MetadataExt;
     let sock = socket_path(session_id);
+    // Snapshot before connect so a replacement during connect/handshake is also
+    // recognized as a different endpoint, rather than waited on until timeout.
+    let socket_identity =
+        std::fs::symlink_metadata(&sock).map(|metadata| (metadata.dev(), metadata.ino()));
     let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(_) => {
@@ -343,6 +348,52 @@ fn cmd_stop(args: &[String]) -> i32 {
     }
 
     eprintln!("Session '{}' stopping", session_id);
+
+    // Monitor handshakes replay scrollback. Consume it while waiting so this
+    // command does not itself keep a drain blocked until the broker's deadline.
+    // EOF alone can precede socket cleanup. Wait for the original endpoint to
+    // disappear or be replaced; a new broker using this ID must not delay stop.
+    use std::io::{ErrorKind, Read};
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut buffer = [0; 64 * 1024];
+    let mut disconnected = false;
+    loop {
+        match std::fs::symlink_metadata(&sock) {
+            Err(e) if e.kind() == ErrorKind::NotFound => break,
+            Ok(metadata) => {
+                if let Ok(identity) = &socket_identity {
+                    if (metadata.dev(), metadata.ino()) != *identity {
+                        break;
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "Warning: session '{}' did not stop within 6 seconds",
+                session_id
+            );
+            break;
+        }
+        let interval = remaining.min(Duration::from_millis(50));
+        if disconnected {
+            std::thread::sleep(interval);
+        } else {
+            let _ = stream.set_read_timeout(Some(interval));
+            match stream.read(&mut buffer) {
+                Ok(0) => disconnected = true,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => disconnected = true,
+            }
+        }
+    }
     0
 }
 
