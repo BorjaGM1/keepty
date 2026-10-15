@@ -323,3 +323,506 @@ def test_watch_detach_resets_terminal_modes(keepty_bin):
         os.close(master)
         os.close(slave)
         cleanup(child, sid)
+
+
+# --- Screen parser, exit, and named keys ---
+
+class ScriptedSession:
+    """Session stand-in that returns scripted read_output results."""
+
+    def __init__(self, events):
+        self.events = list(events)
+
+    def read_output(self, timeout=0.0):
+        if not self.events:
+            return b""
+        item = self.events.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _offline_reader(session=None):
+    pytest.importorskip("pyte")
+    from unittest.mock import Mock
+    from keepty.screen import ScreenReader, _parser_classes
+
+    if session is None:
+        session = Mock()
+    screen_cls, stream_cls = _parser_classes()
+    screen = screen_cls(40, 8)
+    stream = stream_cls(screen)
+    return ScreenReader(session, screen, stream)
+
+
+class TestScreenParser:
+    @pytest.fixture(autouse=True)
+    def _need_pyte(self):
+        pytest.importorskip("pyte")
+
+    def test_private_sgr_and_modify_other_keys_do_not_crash_or_style(self):
+        reader = _offline_reader()
+        # The vim crash is the private SGR at the end of this chunk.
+        reader._feed(b"version info\x1b[1;1H\x1b[?25h\x1b[?4mstill here")
+        assert reader.row(0).startswith("still here")
+        reader = _offline_reader()
+        reader._feed(b"version info\x1b[?4m\x1b[>4;2mHi")
+        assert "version info" in reader.contents()
+        assert "Hi" in reader.contents()
+        hi = reader.row(0).index("Hi")
+        cell = reader._screen.buffer[0][hi]
+        assert cell.data == "H"
+        assert cell.underscore is False
+        # Normal SGR still applies after a private one was ignored.
+        reader._feed(b"\x1b[4m")
+        assert reader._screen.cursor.attrs.underscore is True
+
+    def test_parse_error_does_not_drop_the_rest_of_the_chunk(self):
+        reader = _offline_reader()
+        reader._feed(b"keep\x1b[?5A-tail")
+        assert reader.row(0).startswith("keep-tail")
+        reader._feed(b"A\x1b[?5AB\x1b[?6CC")
+        assert "ABC" in reader.contents()
+
+    def test_gt_csi_split_across_feeds_is_dropped(self):
+        reader = _offline_reader()
+        reader._feed(b"Q\x1b[>4;")
+        assert reader.row(0).strip() == "Q"
+        reader._feed(b"2mZ")
+        assert reader.row(0).startswith("QZ")
+        assert reader._screen.buffer[0][1].data == "Z"
+        assert reader._screen.buffer[0][1].underscore is False
+
+    def test_normal_sgr_split_across_feeds_still_applies(self):
+        reader = _offline_reader()
+        reader._feed(b"\x1b[1;3")
+        reader._feed(b"1mZ")
+        cell = reader._screen.buffer[0][0]
+        assert cell.data == "Z"
+        assert cell.bold is True
+        assert cell.fg == "red"
+
+    def test_overlong_csi_does_not_swallow_following_text(self):
+        # 200 parameter digits exceed the filter's hold limit. The final
+        # "m" ends the sequence; "Y" must still be drawn, not buffered forever.
+        reader = _offline_reader()
+        reader._feed(b"X\x1b[" + b"1" * 200 + b"mY")
+        text = reader.contents()
+        assert "X" in text
+        assert "Y" in text
+
+
+class TestScreenExit:
+    @pytest.fixture(autouse=True)
+    def _need_pyte(self):
+        pytest.importorskip("pyte")
+
+    def test_session_exited_keeps_output_bytes(self):
+        from keepty import SessionExited
+
+        raw = bytearray(b"abc")
+        exc = SessionExited(9, raw)
+        raw[:] = b"zzz"
+        assert exc.exit_code == 9
+        assert exc.output == b"abc"
+        assert isinstance(exc.output, bytes)
+        assert str(SessionExited(9)) == "Session exited with code 9"
+        assert SessionExited(9).output == b""
+
+    def test_poll_records_exit_and_applies_final_output(self):
+        from keepty import SessionExited
+
+        session = ScriptedSession([SessionExited(7, b"hello\r\n")])
+        reader = _offline_reader(session)
+        assert reader.poll(5) is True
+        assert "hello" in reader.contents()
+        assert reader.exited is True
+        assert reader.exit_code == 7
+
+        def _fail_if_called(timeout=0.0):
+            raise AssertionError("read after exit")
+
+        # Later polls must not raise and must not read again.
+        session.read_output = _fail_if_called
+        assert reader.poll(5) is False
+
+    def test_poll_exit_without_output_returns_false(self):
+        from keepty import SessionExited
+
+        reader = _offline_reader(ScriptedSession([SessionExited(2, b"")]))
+        assert reader.poll(0.1) is False
+        assert reader.exited is True
+        assert reader.exit_code == 2
+
+    def test_exit_code_zero_is_an_exit(self):
+        from keepty import SessionExited
+
+        reader = _offline_reader(ScriptedSession([b"hello\r\n", SessionExited(0, b"")]))
+        assert reader.poll_until("hello", timeout=2) is True
+        assert reader.exited is False
+        assert reader.exit_code is None
+        assert reader.poll(0.1) is False
+        assert reader.exited is True
+        assert reader.exit_code == 0
+
+    def test_poll_until_false_when_process_exits_first(self):
+        from keepty import SessionExited
+
+        reader = _offline_reader(ScriptedSession([SessionExited(4, b"nope\r\n")]))
+        started = time.monotonic()
+        assert reader.poll_until("zzz", timeout=5) is False
+        assert time.monotonic() - started < 1
+        assert reader.exit_code == 4
+        assert "nope" in reader.contents()
+
+    def test_poll_until_true_when_text_arrives_with_exit(self):
+        from keepty import SessionExited
+
+        reader = _offline_reader(ScriptedSession([SessionExited(7, b"hello\r\n")]))
+        assert reader.poll_until("hello", timeout=2) is True
+        assert reader.exited is True
+        assert reader.exit_code == 7
+
+    def test_prime_records_exit(self):
+        from keepty import Role, SessionExited
+
+        reader = _offline_reader(ScriptedSession([SessionExited(6, b"primed\r\n")]))
+        reader._prime(Role.MONITOR)
+        assert reader.exit_code == 6
+        assert "primed" in reader.contents()
+
+        reader = _offline_reader(
+            ScriptedSession([b"partial\r\n", SessionExited(8, b"rest\r\n")])
+        )
+        reader._prime(Role.WRITER)
+        assert "partial" in reader.contents()
+        assert "rest" in reader.contents()
+        assert reader.exit_code == 8
+
+
+class TestNamedKeys:
+    @pytest.fixture(autouse=True)
+    def _need_pyte(self):
+        pytest.importorskip("pyte")
+
+    def test_named_key_bytes(self):
+        from unittest.mock import Mock
+
+        reader = _offline_reader(Mock())
+        expected = {
+            "enter": b"\r",
+            "tab": b"\t",
+            "esc": b"\x1b",
+            "backspace": b"\x7f",
+            "up": b"\x1b[A",
+            "down": b"\x1b[B",
+            "left": b"\x1b[D",
+            "right": b"\x1b[C",
+            "home": b"\x1b[H",
+            "end": b"\x1b[F",
+            "pageup": b"\x1b[5~",
+            "pagedown": b"\x1b[6~",
+            "delete": b"\x1b[3~",
+            "f1": b"\x1bOP",
+            "f2": b"\x1bOQ",
+            "f3": b"\x1bOR",
+            "f4": b"\x1bOS",
+            "f5": b"\x1b[15~",
+            "f6": b"\x1b[17~",
+            "f7": b"\x1b[18~",
+            "f8": b"\x1b[19~",
+            "f9": b"\x1b[20~",
+            "f10": b"\x1b[21~",
+            "f11": b"\x1b[23~",
+            "f12": b"\x1b[24~",
+        }
+        for name, payload in expected.items():
+            reader.send_key(name)
+            assert reader.session.send_keys.call_args.args[0] == payload
+        for n, letter in enumerate("abcdefghijklmnopqrstuvwxyz", 1):
+            reader.send_key(f"ctrl-{letter}")
+            assert reader.session.send_keys.call_args.args[0] == bytes([n])
+
+    def test_key_aliases_and_application_cursor_mode(self):
+        from unittest.mock import Mock, call
+
+        session = Mock()
+        reader = _offline_reader(session)
+        reader.send_key("Return")
+        reader.send_key("ESCAPE")
+        reader.send_key("Page_Up")
+        reader.send_key("Page-Down")
+        reader.send_key("Ctrl+C")
+        reader._feed(b"\x1b[?1h")
+        reader.send_key("up")
+        reader.send_key("down")
+        reader.send_key("left")
+        reader.send_key("right")
+        reader.send_key("home")
+        reader.send_key("end")
+        reader._feed(b"\x1b[?1l")
+        reader.send_key("up")
+        reader.send_key("end")
+        assert session.send_keys.call_args_list == [
+            call(b"\r"),
+            call(b"\x1b"),
+            call(b"\x1b[5~"),
+            call(b"\x1b[6~"),
+            call(b"\x03"),
+            call(b"\x1bOA"),
+            call(b"\x1bOB"),
+            call(b"\x1bOD"),
+            call(b"\x1bOC"),
+            call(b"\x1bOH"),
+            call(b"\x1bOF"),
+            call(b"\x1b[A"),
+            call(b"\x1b[F"),
+        ]
+
+    def test_unknown_key_is_rejected(self):
+        from unittest.mock import Mock
+
+        reader = _offline_reader(Mock())
+        with pytest.raises(ValueError):
+            reader.send_key("shift-enter")
+        with pytest.raises(TypeError):
+            reader.send_key(None)
+        reader.session.send_keys.assert_not_called()
+
+    def test_send_text_paste_and_submit_gap(self):
+        from unittest.mock import Mock, patch
+
+        session = Mock()
+        reader = _offline_reader(session)
+        order = []
+        session.send_keys.side_effect = lambda payload: order.append(("send", payload))
+
+        reader.send_text("hi")
+        reader.send_text("ab", paste=True)
+        reader.send_text("a\nb", paste=False)
+        with patch("keepty.screen.time.sleep", side_effect=lambda delay: order.append(("sleep", delay))):
+            reader.send_text("a\nb", submit=True, submit_delay=0.2)
+        assert order == [
+            ("send", b"hi"),
+            ("send", b"\x1b[200~ab\x1b[201~"),
+            ("send", b"a\nb"),
+            ("send", b"\x1b[200~a\nb\x1b[201~"),
+            ("sleep", 0.2),
+            ("send", b"\r"),
+        ]
+
+        order.clear()
+        reader.submit_delay = 0.07
+        with patch("keepty.screen.time.sleep", side_effect=lambda delay: order.append(("sleep", delay))):
+            reader.send_text("z", submit=True)
+            reader.send_text("z", submit=True, submit_delay=0)
+        assert order == [
+            ("send", b"z"),
+            ("sleep", 0.07),
+            ("send", b"\r"),
+            ("send", b"z"),
+            ("send", b"\r"),
+        ]
+        with pytest.raises(TypeError):
+            reader.send_text(b"nope")
+
+    def test_send_text_default_delay_and_validation_before_input(self):
+        from unittest.mock import Mock, patch, call
+
+        reader = _offline_reader(Mock())
+        with patch("keepty.screen.time.sleep") as sleep:
+            reader.send_text("say hi", submit=True)
+            sleep.assert_called_once_with(1.0)
+        assert reader.session.send_keys.call_args_list == [call(b"say hi"), call(b"\r")]
+        reader.session.send_keys.reset_mock()
+        for invalid in [-1, float("nan"), float("inf"), -float("inf")]:
+            for submit in [False, True]:
+                with pytest.raises(ValueError):
+                    reader.send_text("must not send", submit=submit, submit_delay=invalid)
+        for invalid in ["1", object(), True]:
+            with pytest.raises(TypeError):
+                reader.send_text("must not send", submit=True, submit_delay=invalid)
+        reader.submit_delay = -1
+        with pytest.raises(ValueError):
+            reader.send_text("must not send", submit=True)
+        with pytest.raises(TypeError):
+            reader.send_text("must not send", True)
+        reader.session.send_keys.assert_not_called()
+
+
+def _got_lines(reader):
+    lines = []
+    for line in reader.contents().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("GOT "):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                lines.append(parts[1])
+    return lines
+
+
+def _expect_got(reader, hex_payload, timeout=3):
+    before = len(_got_lines(reader))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reader.poll(0.1)
+        lines = _got_lines(reader)
+        received = "".join(lines[before:])
+        assert hex_payload.startswith(received), reader.contents()
+        if received == hex_payload:
+            return
+    raise AssertionError(
+        f"timed out waiting for {hex_payload}. Screen:\n{reader.contents()}"
+    )
+
+
+class TestScreenIntegration:
+    def test_broker_private_sequences_keep_following_text(self, keepty_bin):
+        pytest.importorskip("pyte")
+        import shlex
+        from keepty import ScreenReader
+
+        program = (
+            "import sys, time\n"
+            "sys.stdout.buffer.write(b'BEFORE\\x1b[?4m\\x1b[>4;2m\\x1b[?5AAFTER\\n')\n"
+            "sys.stdout.buffer.flush()\n"
+            "time.sleep(30)\n"
+        )
+        sid = unique_id("private")
+        child = start_broker(sid, "exec python3 -u -c " + shlex.quote(program))
+        try:
+            with ScreenReader.connect(sid, role=Role.WRITER) as reader:
+                assert reader.poll_until("BEFORE", timeout=5), reader.contents()
+                assert "AFTER" in reader.contents()
+        finally:
+            cleanup(child, sid)
+
+    def test_poll_until_stops_when_child_exits(self, keepty_bin):
+        pytest.importorskip("pyte")
+        from keepty import ScreenReader, SessionExited
+
+        sid = unique_id("exit-miss")
+        child = start_broker(sid, "echo nope; exit 4")
+        try:
+            with ScreenReader.connect(sid, role=Role.WRITER) as reader:
+                started = time.monotonic()
+                found = reader.poll_until("not-on-screen", timeout=5)
+                elapsed = time.monotonic() - started
+                assert found is False
+                assert reader.exited is True
+                assert reader.exit_code == 4
+                assert "nope" in reader.contents()
+                assert elapsed < 2.5
+                assert reader.poll(0.2) is False
+        finally:
+            cleanup(child, sid)
+
+        sid = unique_id("exit-hit")
+        child = start_broker(sid, "echo final-words; exit 9")
+        try:
+            with ScreenReader.connect(sid, role=Role.WRITER) as reader:
+                assert reader.poll_until("final-words", timeout=5), reader.contents()
+                deadline = time.monotonic() + 5
+                while not reader.exited and time.monotonic() < deadline:
+                    reader.poll(0.2)
+                assert reader.exited is True
+                assert reader.exit_code == 9
+        finally:
+            cleanup(child, sid)
+
+        sid = unique_id("exit-bytes")
+        child = start_broker(sid, "echo final-words; exit 9")
+        try:
+            with Session.connect(sid) as session:
+                chunks = bytearray()
+                code = None
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        chunks += session.read_output(timeout=0.3)
+                    except SessionExited as exc:
+                        chunks += exc.output
+                        code = exc.exit_code
+                        break
+                assert code == 9
+                assert b"final-words" in chunks
+        finally:
+            cleanup(child, sid)
+
+    def test_vim_screen_and_quit(self, keepty_bin):
+        import shutil
+        if shutil.which("vim") is None:
+            pytest.skip("vim is not installed")
+        pytest.importorskip("pyte")
+        from keepty import ScreenReader
+
+        sid = unique_id("vim")
+        child = start_broker(sid, "exec vim")
+        try:
+            with ScreenReader.connect(sid, role=Role.WRITER) as reader:
+                assert reader.poll_until("VIM", timeout=8), reader.contents()
+                reader.send_text(":q!", submit=True)
+                deadline = time.monotonic() + 5
+                while not reader.exited and time.monotonic() < deadline:
+                    reader.poll(0.2)
+                assert reader.exited, reader.contents()
+                assert reader.exit_code == 0
+        finally:
+            cleanup(child, sid)
+
+    def test_send_key_and_send_text_roundtrip(self, keepty_bin):
+        pytest.importorskip("pyte")
+        import shlex
+        from keepty import ScreenReader
+
+        program = (
+            "import os, select, sys, termios, tty\n"
+            "fd = sys.stdin.fileno()\n"
+            "old = termios.tcgetattr(fd)\n"
+            "tty.setraw(fd)\n"
+            "def emit(msg):\n"
+            "    os.write(1, (msg + '\\r\\n').encode())\n"
+            "try:\n"
+            "    emit('READY')\n"
+            "    while True:\n"
+            "        ready, _, _ = select.select([fd], [], [], 2.0)\n"
+            "        if not ready:\n"
+            "            emit('IDLE')\n"
+            "            break\n"
+            "        data = os.read(fd, 1)\n"
+            "        if not data:\n"
+            "            emit('EOF')\n"
+            "            break\n"
+            "        emit('GOT ' + data.hex())\n"
+            "finally:\n"
+            "    termios.tcsetattr(fd, termios.TCSANOW, old)\n"
+        )
+        sid = unique_id("keys")
+        child = start_broker(sid, "exec python3 -u -c " + shlex.quote(program))
+        try:
+            with ScreenReader.connect(sid, role=Role.WRITER, rows=80) as reader:
+                assert reader.poll_until("READY", timeout=5), reader.contents()
+                reader.send_key("up")
+                _expect_got(reader, "1b5b41")
+                reader.send_key("enter")
+                _expect_got(reader, "0d")
+                reader.send_key("backspace")
+                _expect_got(reader, "7f")
+                reader.send_key("ctrl-c")
+                _expect_got(reader, "03")
+                reader.send_key("f5")
+                _expect_got(reader, "1b5b31357e")
+                reader.send_key("delete")
+                _expect_got(reader, "1b5b337e")
+                reader.send_text("hi")
+                _expect_got(reader, "6869")
+                reader.send_text("a\nb")
+                _expect_got(reader, "1b5b3230307e610a621b5b3230317e")
+                reader.send_text("a\nb", paste=False)
+                _expect_got(reader, "610a62")
+                reader.send_text("ab", paste=True)
+                _expect_got(reader, "1b5b3230307e61621b5b3230317e")
+                reader.send_text("z", submit=True, submit_delay=0.3)
+                _expect_got(reader, "7a0d")
+        finally:
+            cleanup(child, sid)

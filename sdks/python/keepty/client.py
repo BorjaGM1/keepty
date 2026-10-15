@@ -133,6 +133,12 @@ class Session:
 
         Returns:
             Raw output bytes. May be empty if no output within timeout.
+
+        Raises:
+            SessionExited: The child exited while this read was in progress.
+                Bytes collected in this call before the exit frame are on
+                ``SessionExited.output`` and are not included in a return
+                value, because this call raises instead of returning.
         """
         collected = bytearray()
         for frame in self._read_frames(timeout):
@@ -142,7 +148,7 @@ class Session:
                 Frame(MsgKind.PONG).write_to(self._sock)
             elif frame.kind == MsgKind.EXIT:
                 code = decode_exit(frame.payload)
-                raise SessionExited(code)
+                raise SessionExited(code, bytes(collected))
         return bytes(collected)
 
     def read_until(self, expected: str, timeout: float = 5.0) -> str:
@@ -230,10 +236,18 @@ class Session:
 
 
 class SessionExited(Exception):
-    """Raised when the session's process exits."""
+    """Raised when the session's process exits.
 
-    def __init__(self, exit_code: int):
+    ``output`` is PTY data collected in the same ``read_output`` call
+    before the exit frame. It is empty when that call had not yet read
+    any output. ``ScreenReader.poll`` and ``poll_until`` do not raise
+    this; they record the exit and feed ``output`` into the screen.
+    ``Session.read_output`` and ``Session.read_until`` still raise.
+    """
+
+    def __init__(self, exit_code: int, output: bytes = b""):
         self.exit_code = exit_code
+        self.output = bytes(output)
         super().__init__(f"Session exited with code {exit_code}")
 
 
