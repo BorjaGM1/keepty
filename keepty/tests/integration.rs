@@ -1327,17 +1327,31 @@ fn stop_bounds_slow_monitor_shutdown() {
     monitor
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+    // Until stop is issued the Monitor trickles at 64 KiB/s (keeps its socket
+    // writable within the broker's 5 s write timeout), then reads at 2 MiB/s.
+    // Its backlog at stop time therefore does not depend on runner speed (CI
+    // flaked when a slow writer phase let a 2 MiB/s reader drain all 12 MiB).
+    let fast = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_fast = fast.clone();
     let reader = std::thread::spawn(move || {
-        struct SlowReader(std::os::unix::net::UnixStream);
+        struct SlowReader(
+            std::os::unix::net::UnixStream,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        );
         impl std::io::Read for SlowReader {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 let limit = buf.len().min(16 * 1024);
                 let n = std::io::Read::read(&mut self.0, &mut buf[..limit])?;
-                std::thread::sleep(Duration::from_secs_f64(n as f64 / (2.0 * 1024.0 * 1024.0)));
+                let rate = if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    2.0 * 1024.0 * 1024.0
+                } else {
+                    64.0 * 1024.0
+                };
+                std::thread::sleep(Duration::from_secs_f64(n as f64 / rate));
                 Ok(n)
             }
         }
-        let mut monitor = SlowReader(monitor);
+        let mut monitor = SlowReader(monitor, reader_fast);
         let mut total = 0;
         let mut last = None;
         loop {
@@ -1375,6 +1389,7 @@ fn stop_bounds_slow_monitor_shutdown() {
         .args(["stop", &id])
         .spawn()
         .unwrap();
+    fast.store(true, std::sync::atomic::Ordering::SeqCst);
     loop {
         if child.try_wait().unwrap().is_some() {
             break;
