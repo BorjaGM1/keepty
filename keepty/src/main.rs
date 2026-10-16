@@ -566,7 +566,21 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 }
                 reader.send_keys(b"\r")?;
             }
-            reader.sync(Duration::from_secs(5))?;
+            // Input frames have been written; the child may exit before Pong.
+            return match reader.sync(Duration::from_secs(5)) {
+                Ok(()) => Ok(0),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    Ok(3)
+                }
+                Err(e) => Err(e),
+            };
         }
         "keys" => {
             reader.sync(Duration::from_secs(5))?;
@@ -578,7 +592,21 @@ fn run_agent(command: &str, args: &[String]) -> std::io::Result<i32> {
                 };
                 reader.send_keys(&key)?;
             }
-            reader.sync(Duration::from_secs(5))?;
+            // Input frames have been written; the child may exit before Pong.
+            return match reader.sync(Duration::from_secs(5)) {
+                Ok(()) => Ok(0),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    Ok(3)
+                }
+                Err(e) => Err(e),
+            };
         }
         "wait" => {
             if new_text {

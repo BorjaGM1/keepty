@@ -82,6 +82,9 @@ the final Enter before exiting. `keys` accepts `enter`, `tab`, `esc`, `backspace
 `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`,
 `f1`–`f12`, `ctrl-a`–`ctrl-z`, and `space`. Names are case-insensitive;
 `return`, `escape`, `page-up`, and `page-down` are aliases. Unknown keys exit with code 2.
+`send` and `keys` exit 0 when input is delivered and acknowledged, 3 if the session
+exits after the input frames were written, or 1 on any other error (session not
+running, timeout, write failure before delivery, or protocol error).
 `screen` exits 3 if the session exits. `wait` requires exactly one of nonempty
 `--text` or positive `--quiet` and exits 0 on a match or
 unchanged screen, 1 on timeout, or 3 when the session exits. Quiet detection
@@ -272,3 +275,23 @@ keepty does less than tmux. What it does — persistence, native rendering, a pr
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE).
+
+## Background agents
+
+Run long agents and jobs detached, check on them later, and recover after disconnects or a VM restart: see [docs/BACKGROUND-AGENTS.md](docs/BACKGROUND-AGENTS.md).
+
+## End-to-end tests
+
+Run the real-process CLI, SDK, Monitor, shutdown, curses, and vim tests on Linux:
+
+```sh
+python3 tests/e2e/run.py
+```
+
+The runner builds `target/release/keepty` if missing (or uses `KEEPTY_BIN`),
+uses a private runtime directory and unique session IDs, and cleans up its sessions
+on failure. It needs only Python 3 and the in-repo SDK; vim is skipped if unavailable.
+Use `-k pattern` to filter case names (substring or shell glob) and `--repeat N`
+to repeat them. Each case prints PASS/FAIL/SKIP, followed by group timings and a
+summary; failures return a nonzero exit code. The optional codex smoke test requires
+configured credentials and `KEEPTY_E2E_AGENTS=1`; it is skipped by default.

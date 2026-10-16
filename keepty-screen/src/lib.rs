@@ -380,6 +380,8 @@ impl ScreenReader {
             }
             let result = self.poll(remaining.min(Duration::from_millis(20)));
             if self.pongs != before {
+                // Intentionally succeed on Pong even if Exit arrived in the same poll:
+                // the broker has acknowledged the preceding input.
                 return Ok(());
             }
             result?;

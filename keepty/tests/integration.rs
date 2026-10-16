@@ -1610,3 +1610,24 @@ fn start_during_shutdown_survives() {
     drop(writer);
     reader.join().unwrap();
 }
+
+#[test]
+fn cli_send_child_exits_on_first_input_byte() {
+    for _ in 0..20 {
+        let id = unique_id("cli-send-exit");
+        let child = start_broker(
+            &id,
+            r#"stty raw -echo; python3 -u -c 'import os
+os.write(1,b"READY")
+assert os.read(0,1) == b"q"'"#,
+        );
+        let mut writer = connect(&id, Role::Writer);
+        assert!(
+            read_until_output_contains(&mut writer, "READY", Duration::from_secs(5))
+                .contains("READY")
+        );
+        let result = agent_cli(&["send", &id, "q"]);
+        cleanup(child, &id);
+        assert!(matches!(result.status.code(), Some(0 | 3)), "{result:?}");
+    }
+}
